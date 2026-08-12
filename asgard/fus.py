@@ -62,6 +62,30 @@ _DECRYPT_THREADS = _available_worker_count()
 _CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", re.IGNORECASE)
 
 
+class BandwidthLimiter:
+    """A thread-safe aggregate byte-rate limiter."""
+
+    def __init__(self, bytes_per_second: int | None):
+        self.rate = int(bytes_per_second or 0)
+        if self.rate < 0:
+            raise ValueError("bandwidth limit cannot be negative")
+        self._lock = threading.Lock()
+        self._available_at = time.monotonic()
+
+    def consume(self, size: int) -> None:
+        if self.rate <= 0 or size <= 0:
+            return
+        duration = size / self.rate
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._available_at)
+            finish = start + duration
+            self._available_at = finish
+        delay = finish - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+
+
 def _md5_digest(text: str) -> bytes:
     return hashlib.md5(text.encode("utf-8"), usedforsecurity=False).digest()
 
@@ -335,9 +359,15 @@ def _resume_done_bytes(ranges: list[dict[str, int]]) -> int:
     return sum(max(0, int(item["offset"]) - int(item["start"])) for item in ranges)
 
 
-def _prepare_range_resume_state(data_path: Path, total_size: int, resume: bool) -> tuple[list[dict[str, int]], Path]:
+def _prepare_range_resume_state(
+    data_path: Path,
+    total_size: int,
+    resume: bool,
+    *,
+    part_count: int = _DOWNLOAD_THREADS,
+) -> tuple[list[dict[str, int]], Path]:
     meta_path = _resume_state_path(data_path)
-    default_ranges = _build_range_parts(total_size)
+    default_ranges = _build_range_parts(total_size, part_count=part_count)
     ranges = default_ranges
     if resume and meta_path.is_file():
         try:
@@ -655,6 +685,7 @@ class _FUSDecryptingReader(io.RawIOBase):
         key: bytes,
         recover_download: Callable[[], None] | None = None,
         stream_chunk_size: int = _RANGE_CHUNK_SIZE,
+        rate_limiter: BandwidthLimiter | None = None,
     ):
         super().__init__()
         self._response: requests.Response | None = None
@@ -669,6 +700,7 @@ class _FUSDecryptingReader(io.RawIOBase):
         self._key = key
         self._recover_download = recover_download
         self._stream_chunk_size = stream_chunk_size
+        self._rate_limiter = rate_limiter
         self._position = 0
         self._response_iter: Iterator[bytes] | None = None
         self._cipher: AES | None = None
@@ -837,6 +869,8 @@ class _FUSDecryptingReader(io.RawIOBase):
                 chunk = next(self._response_iter)
                 if not chunk:
                     continue
+                if self._rate_limiter is not None:
+                    self._rate_limiter.consume(len(chunk))
                 encrypted = self._cipher_buffer + chunk if self._cipher_buffer else chunk
                 block_size = (len(encrypted) // _AES_BLOCK_SIZE) * _AES_BLOCK_SIZE
                 if block_size == 0:
@@ -1098,8 +1132,14 @@ def initialize_download(client: FUSClient, info: BinaryInfo, region: str) -> Non
     )
 
 
-def get_v4_key(model: str, region: str, *, firmware_version: str | None = None) -> bytes:
-    client = FUSClient()
+def get_v4_key(
+    model: str,
+    region: str,
+    *,
+    firmware_version: str | None = None,
+    timeout_s: int = 30,
+) -> bytes:
+    client = FUSClient(timeout_s=timeout_s)
     info = _resolve_versioned_info(client, model, region, firmware_version)
     binary_version = info.binary_version
     logic_value = info.logic_value
@@ -1169,6 +1209,9 @@ def decrypt_firmware(
     in_file: str | os.PathLike[str],
     out_file: str | os.PathLike[str],
     enc_ver: int = 4,
+    resume: bool = False,
+    threads: int | None = None,
+    timeout_s: int = 30,
 ) -> Path:
     in_path = Path(in_file).expanduser()
     out_path = Path(out_file).expanduser()
@@ -1178,18 +1221,27 @@ def decrypt_firmware(
     if length % _AES_BLOCK_SIZE != 0:
         raise FUSError("invalid encrypted input size")
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.exists():
+        raise FUSError(f"{out_path} already exists")
+    worker_count = _DECRYPT_THREADS if threads is None else int(threads)
+    if worker_count <= 0:
+        raise ValueError("threads must be positive")
     if int(enc_ver) == 4:
-        key = get_v4_key(model, region, firmware_version=version)
+        key = get_v4_key(model, region, firmware_version=version, timeout_s=timeout_s)
     else:
         if not str(version or "").strip():
             raise ValueError("firmware version is required for enc2 decrypt")
         key = get_v2_key(str(version), model, region)
 
-    ranges = _build_range_parts(length, part_count=_DECRYPT_THREADS)
-    with out_path.open("wb") as fh:
-        fh.truncate(length)
+    part_path = _partial_output_path(out_path)
+    ranges, meta_path = _prepare_range_resume_state(
+        part_path,
+        length,
+        resume,
+        part_count=worker_count,
+    )
 
-    done = 0
+    done = _resume_done_bytes(ranges)
     done_lock = threading.Lock()
     started_at = time.monotonic()
 
@@ -1198,25 +1250,38 @@ def decrypt_firmware(
             nonlocal done
             with done_lock:
                 done += size
+                item["offset"] = int(item["offset"]) + size
 
-        _decrypt_range(in_path, out_path, key, int(item["start"]), int(item["end"]), progress=update_progress)
+        start = int(item["offset"])
+        end = int(item["end"])
+        if start <= end:
+            _decrypt_range(in_path, part_path, key, start, end, progress=update_progress)
+            with done_lock:
+                item["offset"] = end + 1
 
     with ThreadPoolExecutor(max_workers=len(ranges) or 1) as executor:
         futures = [executor.submit(worker, item) for item in ranges]
+        last_saved = -1
         while True:
             completed = all(future.done() for future in futures)
             with done_lock:
                 current_done = done
+                snapshot = [dict(item) for item in ranges]
             _render_progress(
                 "Decrypting", current_done, length, started_at, complete=completed and current_done >= length
             )
+            if current_done != last_saved:
+                _save_range_resume_state(meta_path, length, snapshot)
+                last_saved = current_done
             if completed:
                 for future in futures:
                     future.result()
                 break
             time.sleep(_PROGRESS_REFRESH_S)
 
-    _finalize_decrypted_file(out_path)
+    _finalize_decrypted_file(part_path)
+    part_path.replace(out_path)
+    meta_path.unlink(missing_ok=True)
     return out_path
 
 
@@ -1273,6 +1338,7 @@ def _download_ranges_parallel(
     ranges: list[dict[str, int]],
     decrypt_key: bytes | None = None,
     recover_download: Callable[[], None] | None = None,
+    rate_limiter: BandwidthLimiter | None = None,
 ) -> None:
     state_lock = threading.Lock()
     stop_event = threading.Event()
@@ -1318,6 +1384,8 @@ def _download_ranges_parallel(
                             return
                         if not chunk:
                             continue
+                        if rate_limiter is not None:
+                            rate_limiter.consume(len(chunk))
                         if len(chunk) > expected_response_size - response_received:
                             raise RetryableDownloadError(f"range {range_idx + 1} received more data than requested")
                         response_received += len(chunk)
@@ -1444,10 +1512,16 @@ def download_firmware(
     out_file: str | os.PathLike[str] | None = None,
     resume: bool = False,
     auto_decrypt: bool = False,
+    threads: int | None = None,
+    timeout_s: int = 30,
+    rate_limit: int | None = None,
 ) -> DownloadResult:
     model_u, region_u = _device_codes(model, region)
 
-    client = FUSClient()
+    worker_count = _DOWNLOAD_THREADS if threads is None else int(threads)
+    if worker_count <= 0:
+        raise ValueError("threads must be positive")
+    client = FUSClient(timeout_s=timeout_s)
     info = _resolve_versioned_info(client, model_u, region_u, firmware_version)
     firmware = info.binary_version or ""
     if not firmware:
@@ -1468,7 +1542,12 @@ def download_firmware(
     if encrypted_path.exists() and not auto_decrypt and not resume:
         raise FUSError(f"{encrypted_path} already exists, use --resume or choose another output")
 
-    ranges, meta_path = _prepare_range_resume_state(temp_path, info.size, resume)
+    ranges, meta_path = _prepare_range_resume_state(
+        temp_path,
+        info.size,
+        resume,
+        part_count=worker_count,
+    )
     done_before = _resume_done_bytes(ranges)
 
     initialize_download(client, info, region_u)
@@ -1486,6 +1565,7 @@ def download_firmware(
     _print_info(f"output: {final_path if auto_decrypt else temp_path}")
     if done_before:
         _print_info(f"resume: {_format_bytes(done_before)}")
+    limiter = BandwidthLimiter(rate_limit)
 
     if not auto_decrypt:
         if done_before < info.size:
@@ -1496,6 +1576,7 @@ def download_firmware(
                 total_size=info.size,
                 ranges=ranges,
                 recover_download=recover_download,
+                rate_limiter=limiter,
             )
         meta_path.unlink(missing_ok=True)
         return DownloadResult(temp_path, None, firmware, info.filename, info.size)
@@ -1510,6 +1591,7 @@ def download_firmware(
             ranges=ranges,
             decrypt_key=decrypt_key,
             recover_download=recover_download,
+            rate_limiter=limiter,
         )
     meta_path.unlink(missing_ok=True)
     final_stream_path = _finalize_stream_decrypted_file(temp_path, final_path)

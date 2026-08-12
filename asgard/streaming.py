@@ -101,10 +101,11 @@ def copy_stream_with_progress(
     label: str,
     total_size: int,
     initial: bytes = b"",
+    initial_done: int = 0,
 ) -> int:
     started_at = time.monotonic()
     last_render = 0.0
-    done = len(initial)
+    done = int(initial_done) + len(initial)
     if initial:
         output.write(initial)
     while True:

@@ -7,8 +7,21 @@ import os
 import sys
 import time
 
+_QUIET = False
+
+
+def set_quiet(quiet: bool) -> None:
+    global _QUIET
+    _QUIET = bool(quiet)
+
+
+def is_quiet() -> bool:
+    return _QUIET
+
 
 def print_info(message: str) -> None:
+    if _QUIET:
+        return
     print(message, flush=True)
 
 
@@ -36,6 +49,8 @@ def render_progress(
     speed_done: int | None = None,
     complete: bool = False,
 ) -> None:
+    if _QUIET:
+        return
     elapsed = max(time.monotonic() - started_at, 0.001)
     speed = (done if speed_done is None else speed_done) / elapsed
     if total > 0:

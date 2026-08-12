@@ -120,9 +120,11 @@ def _open_remote_firmware_archive(
     model: str,
     region: str,
     firmware_version: str | None = None,
+    timeout_s: int = 30,
+    rate_limit: int | None = None,
 ) -> Iterator[_RemoteFirmwareArchive]:
     model_u, region_u = _fus._device_codes(model, region)
-    client = _fus.FUSClient()
+    client = _fus.FUSClient(timeout_s=timeout_s)
     try:
         info = _fus._resolve_versioned_info(client, model_u, region_u, firmware_version)
         firmware = info.binary_version or ""
@@ -143,6 +145,7 @@ def _open_remote_firmware_archive(
             key=_fus._decryption_key_from_info(info, model_u, region_u),
             recover_download=recover_download,
             stream_chunk_size=_ARCHIVE_COPY_CHUNK_SIZE,
+            rate_limiter=_fus.BandwidthLimiter(rate_limit),
         )
     except Exception:
         client.session.close()
@@ -182,11 +185,15 @@ def list_firmware_entries(
     model: str,
     region: str,
     firmware_version: str | None = None,
+    timeout_s: int = 30,
+    rate_limit: int | None = None,
 ) -> FirmwareArchiveListing:
     with _open_remote_firmware_archive(
         model=model,
         region=region,
         firmware_version=firmware_version,
+        timeout_s=timeout_s,
+        rate_limit=rate_limit,
     ) as remote:
         entries = tuple(
             FirmwareArchiveEntry(
@@ -633,11 +640,15 @@ def iter_firmware_tar_entries(
     region: str,
     outer_selector: str,
     firmware_version: str | None = None,
+    timeout_s: int = 30,
+    rate_limit: int | None = None,
 ) -> Iterator[FirmwareTarEntry]:
     with _open_remote_firmware_archive(
         model=model,
         region=region,
         firmware_version=firmware_version,
+        timeout_s=timeout_s,
+        rate_limit=rate_limit,
     ) as remote:
         outer_entry = _select_single_firmware_entry(remote.archive.infolist(), outer_selector)
         if outer_entry.compress_type == zipfile.ZIP_DEFLATED:
@@ -723,6 +734,42 @@ def _entry_output_path(output_dir: Path, entry_name: str) -> Path:
     return output_dir / filename
 
 
+def _discard_stream(source: io.BufferedIOBase, size: int, description: str) -> None:
+    remaining = size
+    while remaining:
+        chunk = source.read(min(remaining, _ARCHIVE_COPY_CHUNK_SIZE))
+        if not chunk:
+            raise FUSError(f"unexpected end while resuming {description}")
+        remaining -= len(chunk)
+
+
+def _copy_resumable_source(
+    source: io.BufferedIOBase,
+    part_path: Path,
+    *,
+    total_size: int,
+    label: str,
+) -> None:
+    initial_size = part_path.stat().st_size if part_path.is_file() else 0
+    if initial_size > total_size:
+        raise FUSError(f"resume source is larger than expected: {part_path}")
+    if initial_size == total_size:
+        return
+    if initial_size:
+        _discard_stream(source, initial_size, label)
+    mode = "ab" if initial_size else "xb"
+    with part_path.open(mode) as output:
+        done = copy_stream_with_progress(
+            source,
+            output,
+            label=label,
+            total_size=total_size,
+            initial_done=initial_size,
+        )
+    if done != total_size:
+        raise FUSError(f"incomplete {label.lower()}: expected {total_size} bytes, got {done}")
+
+
 def _write_firmware_tar_member(
     source: io.BufferedIOBase,
     part_path: Path,
@@ -756,6 +803,9 @@ def download_firmware_tar_member(
     out_dir: str | os.PathLike[str],
     firmware_version: str | None = None,
     keep_sparse: bool = False,
+    resume: bool = False,
+    timeout_s: int = 30,
+    rate_limit: int | None = None,
 ) -> Path:
     requested_name = str(member_name or "").strip().replace("\\", "/")
     if not requested_name:
@@ -767,15 +817,20 @@ def download_firmware_tar_member(
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = _entry_output_path(output_dir.resolve(), output_name)
     part_path = _fus._partial_output_path(destination)
+    source_part_path: Path | None = None
+    if destination.exists() and resume:
+        return destination
     if destination.exists():
         raise FUSError(f"{destination} already exists")
-    if part_path.exists():
+    if part_path.exists() and not resume:
         raise FUSError(f"{part_path} already exists")
 
     with _open_remote_firmware_archive(
         model=model,
         region=region,
         firmware_version=firmware_version,
+        timeout_s=timeout_s,
+        rate_limit=rate_limit,
     ) as remote:
         outer_entry = _select_single_firmware_entry(remote.archive.infolist(), outer_selector)
         print_info(f"model: {remote.model}")
@@ -787,6 +842,38 @@ def download_firmware_tar_member(
 
         output_complete = False
         try:
+            def write_member(member_source: io.BufferedIOBase, member_size: int) -> None:
+                nonlocal source_part_path
+                if not resume:
+                    _write_firmware_tar_member(
+                        member_source,
+                        part_path,
+                        requested_name=requested_name,
+                        output_name=output_name,
+                        member_size=member_size,
+                        keep_sparse=keep_sparse,
+                    )
+                    return
+                source_part_path = destination.with_name(
+                    f".{destination.name}.{member_size}.asgard-source.part"
+                )
+                _copy_resumable_source(
+                    member_source,
+                    source_part_path,
+                    total_size=member_size,
+                    label=f"Caching {PurePosixPath(requested_name).name}",
+                )
+                part_path.unlink(missing_ok=True)
+                with source_part_path.open("rb") as local_source:
+                    _write_firmware_tar_member(
+                        local_source,
+                        part_path,
+                        requested_name=requested_name,
+                        output_name=output_name,
+                        member_size=member_size,
+                        keep_sparse=keep_sparse,
+                    )
+
             member_copied = False
             cached: _TarIndexCache | None = None
             cached_member: _IndexedTarMember | None = None
@@ -808,14 +895,7 @@ def download_firmware_tar_member(
                             cached_member,
                             cached.index_path,
                         ) as member_source:
-                            _write_firmware_tar_member(
-                                member_source,
-                                part_path,
-                                requested_name=requested_name,
-                                output_name=output_name,
-                                member_size=cached_member.size,
-                                keep_sparse=keep_sparse,
-                            )
+                            write_member(member_source, cached_member.size)
                         member_copied = True
                     except StreamSourceError:
                         part_path.unlink(missing_ok=True)
@@ -835,14 +915,7 @@ def download_firmware_tar_member(
                         if member_source is None:
                             raise FUSError(f"could not open TAR member: {requested_name}")
                         with member_source:
-                            _write_firmware_tar_member(
-                                member_source,
-                                part_path,
-                                requested_name=requested_name,
-                                output_name=output_name,
-                                member_size=member.size,
-                                keep_sparse=keep_sparse,
-                            )
+                            write_member(member_source, member.size)
                         member_copied = True
                         break
 
@@ -851,6 +924,8 @@ def download_firmware_tar_member(
             if destination.exists():
                 raise FUSError(f"{destination} already exists")
             part_path.replace(destination)
+            if source_part_path is not None:
+                source_part_path.unlink(missing_ok=True)
             output_complete = True
             return destination
         except FUSError:
@@ -945,11 +1020,15 @@ def _run_firmware_super_operation(
     firmware_version: str | None,
     operation: Callable[[io.BufferedIOBase, str, int], _T],
     prefer_cached: bool,
+    timeout_s: int = 30,
+    rate_limit: int | None = None,
 ) -> _T:
     with _open_remote_firmware_archive(
         model=model,
         region=region,
         firmware_version=firmware_version,
+        timeout_s=timeout_s,
+        rate_limit=rate_limit,
     ) as remote:
         outer_entry = _select_single_firmware_entry(remote.archive.infolist(), outer_selector)
         print_info(f"model: {remote.model}")
@@ -970,6 +1049,8 @@ def iter_firmware_super_partitions(
     region: str,
     outer_selector: str,
     firmware_version: str | None = None,
+    timeout_s: int = 30,
+    rate_limit: int | None = None,
 ) -> Iterator[FirmwareSuperPartition]:
     partitions = _run_firmware_super_operation(
         model=model,
@@ -978,6 +1059,8 @@ def iter_firmware_super_partitions(
         firmware_version=firmware_version,
         operation=list_super_partitions,
         prefer_cached=True,
+        timeout_s=timeout_s,
+        rate_limit=rate_limit,
     )
     yield from partitions
 
@@ -990,6 +1073,9 @@ def download_firmware_super_partitions(
     partitions: tuple[str, ...] | list[str] | None,
     output: str | os.PathLike[str],
     firmware_version: str | None = None,
+    resume: bool = False,
+    timeout_s: int = 30,
+    rate_limit: int | None = None,
 ) -> tuple[Path, ...]:
     requested = None if partitions is None else tuple(partitions)
     output_dir = Path(output).expanduser()
@@ -997,19 +1083,58 @@ def download_firmware_super_partitions(
         raise FUSError(f"partition output must be a directory: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
     output_dir = output_dir.resolve()
+
+    def extract_operation(source: io.BufferedIOBase, name: str, size: int) -> tuple[Path, ...]:
+        if not resume:
+            return extract_super_partitions(
+                source,
+                name,
+                size,
+                requested=requested,
+                output_dir=output_dir,
+            )
+        stage_name = PurePosixPath(name.replace("\\", "/")).name
+        source_part = output_dir / f".{stage_name}.{size}.asgard-source.part"
+        _copy_resumable_source(
+            source,
+            source_part,
+            total_size=size,
+            label=f"Caching {stage_name}",
+        )
+        with source_part.open("rb") as local_source:
+            available = list_super_partitions(local_source, name, size)
+        selected_names = (
+            tuple(partition.name for partition in available)
+            if requested is None
+            else tuple(requested)
+        )
+        destinations = tuple(output_dir / f"{partition_name}.img" for partition_name in selected_names)
+        existing = tuple(path.exists() for path in destinations)
+        if destinations and all(existing):
+            source_part.unlink(missing_ok=True)
+            return destinations
+        if any(existing):
+            raise FUSError("only some requested partition outputs exist; move them away before resuming")
+        with source_part.open("rb") as local_source:
+            paths = extract_super_partitions(
+                local_source,
+                name,
+                size,
+                requested=requested,
+                output_dir=output_dir,
+            )
+        source_part.unlink(missing_ok=True)
+        return paths
+
     return _run_firmware_super_operation(
         model=model,
         region=region,
         outer_selector=outer_selector,
         firmware_version=firmware_version,
-        operation=lambda source, name, size: extract_super_partitions(
-            source,
-            name,
-            size,
-            requested=requested,
-            output_dir=output_dir,
-        ),
+        operation=extract_operation,
         prefer_cached=False,
+        timeout_s=timeout_s,
+        rate_limit=rate_limit,
     )
 
 
@@ -1020,6 +1145,9 @@ def download_firmware_entries(
     selectors: tuple[str, ...] | list[str],
     out_dir: str | os.PathLike[str],
     firmware_version: str | None = None,
+    resume: bool = False,
+    timeout_s: int = 30,
+    rate_limit: int | None = None,
 ) -> tuple[Path, ...]:
     selector_values = tuple(str(selector) for selector in selectors)
     if not selector_values:
@@ -1034,9 +1162,12 @@ def download_firmware_entries(
         model=model,
         region=region,
         firmware_version=firmware_version,
+        timeout_s=timeout_s,
+        rate_limit=rate_limit,
     ) as remote:
         selected = _select_firmware_entries(remote.archive.infolist(), selector_values)
         destinations: list[tuple[zipfile.ZipInfo, Path]] = []
+        already_complete: set[Path] = set()
         destination_keys: set[str] = set()
         for entry in selected:
             destination = _entry_output_path(output_root, entry.filename)
@@ -1044,7 +1175,9 @@ def download_firmware_entries(
             if destination_key in destination_keys:
                 raise FUSError(f"multiple archive entries map to the same output path: {destination}")
             destination_keys.add(destination_key)
-            if destination.exists():
+            if destination.exists() and resume and destination.stat().st_size == entry.file_size:
+                already_complete.add(destination)
+            elif destination.exists():
                 raise FUSError(f"{destination} already exists")
             destinations.append((entry, destination))
 
@@ -1057,24 +1190,35 @@ def download_firmware_entries(
         print_info(f"output: {output_dir}")
 
         for entry, destination in sorted(destinations, key=lambda item: item[0].header_offset):
+            if destination in already_complete:
+                continue
             complete = False
             part_path = _fus._partial_output_path(destination)
             try:
-                with (
-                    part_path.open("xb") as output,
-                    remote.archive.open(entry, "r") as source,
-                    open_prefetched_stream(source) as prefetched,
-                ):
-                    done = copy_stream_with_progress(
-                        prefetched,
-                        output,
-                        label=f"Downloading {PurePosixPath(entry.filename).name}",
-                        total_size=entry.file_size,
+                initial_size = part_path.stat().st_size if resume and part_path.is_file() else 0
+                if initial_size > entry.file_size:
+                    raise FUSError(f"partial archive entry is larger than expected: {part_path}")
+                if initial_size == entry.file_size:
+                    done = initial_size
+                else:
+                    with remote.archive.open(entry, "r") as source:
+                        if initial_size:
+                            _discard_stream(source, initial_size, entry.filename)
+                        with (
+                            part_path.open("ab" if initial_size else "xb") as output,
+                            open_prefetched_stream(source) as prefetched,
+                        ):
+                            done = copy_stream_with_progress(
+                                prefetched,
+                                output,
+                                label=f"Downloading {PurePosixPath(entry.filename).name}",
+                                total_size=entry.file_size,
+                                initial_done=initial_size,
+                            )
+                if done != entry.file_size:
+                    raise FUSError(
+                        f"incomplete archive entry {entry.filename!r}: expected {entry.file_size} bytes, got {done}"
                     )
-                    if done != entry.file_size:
-                        raise FUSError(
-                            f"incomplete archive entry {entry.filename!r}: expected {entry.file_size} bytes, got {done}"
-                        )
                 if destination.exists():
                     raise FUSError(f"{destination} already exists")
                 part_path.replace(destination)
@@ -1084,7 +1228,7 @@ def download_firmware_entries(
             except Exception as exc:
                 raise FUSError(f"could not extract archive entry {entry.filename!r}: {exc}") from exc
             finally:
-                if not complete:
+                if not complete and not resume:
                     part_path.unlink(missing_ok=True)
 
         return tuple(destination for _entry, destination in destinations)
