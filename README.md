@@ -124,7 +124,7 @@ The following options control download behavior:
 | `--json` | Write machine-readable JSON to standard output. |
 
 Full downloads share 16 MiB ranges between workers, so faster connections can
-pick up more work. Without `--threads`, downloads start with two workers and
+pick up more work. Without `--threads`, downloads start with four workers and
 probe for higher throughput, up to 16 workers. Automatic mode backs off after
 retries and rolls back probes that do not improve throughput. Changes take
 effect as workers finish their current ranges.

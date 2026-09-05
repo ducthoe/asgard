@@ -4,12 +4,18 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import os
 import tarfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from typing import BinaryIO
 
 from .constants import (
+    _HASH_CHUNK_SIZE,
+    _HASH_PARALLEL_MIN_SIZE,
     _SPARSE_CHUNK_HEADER,
     _SPARSE_CRC32,
     _SPARSE_DONT_CARE,
@@ -25,26 +31,37 @@ def _hash_file(path: Path) -> tuple[str, str]:
     sha256 = hashlib.sha256()
     md5 = hashlib.md5(usedforsecurity=False)
     with path.open("rb") as source:
-        buffer = bytearray(1024 * 1024)
+        prefix = source.read(io.DEFAULT_BUFFER_SIZE)
+        sha256.update(prefix)
+        md5.update(prefix)
+        if len(prefix) < io.DEFAULT_BUFFER_SIZE:
+            return sha256.hexdigest(), md5.hexdigest()
+        size = os.fstat(source.fileno()).st_size
+        buffer = bytearray(min(_HASH_CHUNK_SIZE, max(1, size)))
         view = memoryview(buffer)
-        while size := source.readinto(buffer):
-            chunk = view[:size]
-            sha256.update(chunk)
-            md5.update(chunk)
+        pool = ThreadPoolExecutor(max_workers=1) if size >= _HASH_PARALLEL_MIN_SIZE else nullcontext()
+        with pool as executor:
+            while size := source.readinto(buffer):
+                chunk = view[:size]
+                if executor is None:
+                    sha256.update(chunk)
+                    md5.update(chunk)
+                else:
+                    pending = executor.submit(sha256.update, chunk)
+                    md5.update(chunk)
+                    pending.result()
     return sha256.hexdigest(), md5.hexdigest()
 
 
-def _skip_exact(source: BinaryIO, size: int, description: str) -> None:
-    remaining = size
-    while remaining:
-        chunk = source.read(min(remaining, 1024 * 1024))
-        if not chunk:
-            raise FUSError(f"unexpected end of {description}")
-        remaining -= len(chunk)
+def _skip_exact(source: BinaryIO, size: int, description: str, *, file_size: int) -> None:
+    if size < 0 or size > file_size - source.tell():
+        raise FUSError(f"unexpected end of {description}")
+    source.seek(size, os.SEEK_CUR)
 
 
 def _verify_sparse(path: Path) -> dict[str, object] | None:
     with path.open("rb") as source:
+        file_size = os.fstat(source.fileno()).st_size
         prefix = source.read(_SPARSE_HEADER.size)
         if len(prefix) < 4 or int.from_bytes(prefix[:4], "little") != _SPARSE_MAGIC:
             return None
@@ -61,7 +78,7 @@ def _verify_sparse(path: Path) -> dict[str, object] | None:
             or block_size <= 0
         ):
             raise FUSError("invalid Android sparse header")
-        _skip_exact(source, file_header_size - _SPARSE_HEADER.size, "sparse file header")
+        _skip_exact(source, file_header_size - _SPARSE_HEADER.size, "sparse file header", file_size=file_size)
         produced_blocks = 0
         for index in range(total_chunks):
             raw = source.read(chunk_header_size)
@@ -77,7 +94,7 @@ def _verify_sparse(path: Path) -> dict[str, object] | None:
             }.get(chunk_type)
             if expected is None or payload_size != expected:
                 raise FUSError(f"invalid sparse chunk {index + 1}")
-            _skip_exact(source, payload_size, f"sparse chunk {index + 1}")
+            _skip_exact(source, payload_size, f"sparse chunk {index + 1}", file_size=file_size)
             if chunk_type != _SPARSE_CRC32:
                 produced_blocks += chunk_blocks
         if produced_blocks != total_blocks or source.read(1):
