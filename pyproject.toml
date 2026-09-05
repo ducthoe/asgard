@@ -6,8 +6,11 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "asgard"
+name = "asgard-fus"
 version = "3.0.0"
+description = "Samsung Firmware Update Server client"
+readme = "README.md"
+requires-python = ">=3.10"
 license = "GPL-3.0-only"
 license-files = ["LICENSE"]
 authors = [{ name = "ducthoe" }]
@@ -17,6 +20,11 @@ dependencies = [
     "pycryptodomex>=3.20.0",
     "requests>=2.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ducthoe/asgard"
+Source = "https://github.com/ducthoe/asgard"
+Issues = "https://github.com/ducthoe/asgard/issues"
 
 [project.scripts]
 asgard = "asgard.cli:main"

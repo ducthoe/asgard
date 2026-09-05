@@ -26,12 +26,10 @@ Android super images without downloading the complete package first.
 
 ## Installation
 
-Clone the repository and install the package with `pip`:
+Install the package from PyPI:
 
 ```console
-git clone https://github.com/ducthoe/asgard.git
-cd asgard
-python3 -m pip install .
+python3 -m pip install asgard-fus
 ```
 
 Verify the installation:
