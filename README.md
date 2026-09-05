@@ -117,11 +117,21 @@ The following options control download behavior:
 | Option | Description |
 | --- | --- |
 | `--resume` | Resume an interrupted download or extraction operation. |
-| `--threads N` | Use `N` download or decryption workers. |
+| `--threads N` | Use a fixed limit of `N` download workers, or `N` decryption workers. |
 | `--timeout SECONDS` | Set the network request timeout. |
 | `--limit-rate RATE` | Limit the aggregate transfer rate, for example `500K`, `10M`, or `1GiB`. |
 | `--quiet` | Suppress informational and progress output. |
 | `--json` | Write machine-readable JSON to standard output. |
+
+Full downloads share 16 MiB ranges between workers, so faster connections can
+pick up more work. Without `--threads`, downloads start with two workers and
+probe for higher throughput, up to 16 workers. Automatic mode backs off after
+retries and rolls back probes that do not improve throughput. Changes take
+effect as workers finish their current ranges.
+
+Resume progress is independent of worker count. You can change `--threads`
+between runs; valid progress from older resume files is retained too. The
+partial data file and its `.resume.json` file must both be present.
 
 ### Archive inspection and extraction
 

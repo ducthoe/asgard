@@ -137,7 +137,9 @@ def _add_network_options(parser: argparse.ArgumentParser, *, threads: bool = Fal
     parser.add_argument("--timeout", type=_positive_int, default=30, metavar="SECONDS")
     parser.add_argument("--limit-rate", type=_parse_byte_rate, metavar="RATE", help="Aggregate limit, e.g. 10M")
     if threads:
-        parser.add_argument("--threads", type=_positive_int, help="Number of download/decrypt workers")
+        parser.add_argument(
+            "--threads", type=_positive_int, help="Fixed download worker limit (default: automatic), or decrypt workers"
+        )
 
 
 def _add_manifest_option(parser: argparse.ArgumentParser) -> None:

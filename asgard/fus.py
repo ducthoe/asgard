@@ -12,6 +12,7 @@ import secrets
 import threading
 import time
 import xml.etree.ElementTree as ET
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from http.cookies import CookieError, SimpleCookie
@@ -28,6 +29,7 @@ from .constants import (
     _AUTH_NONCE_COUNT,
     _AUTH_SIGNATURE_ALPHABET,
     _DOWNLOAD_CHUNK_SIZE,
+    _DOWNLOAD_MAX_WORKERS,
     _DOWNLOAD_RECOVERY_INTERVAL,
     _DOWNLOAD_RETRIES,
     _FUS_BASE_URL,
@@ -40,12 +42,12 @@ from .constants import (
     _RATE_LIMIT_COOLDOWN_S,
     _RESUME_META_SAVE_INTERVAL_S,
     _RETRY_BACKOFF_S,
-    _THREAD_STAGGER_S,
 )
 from .errors import FUSError, RetryableDownloadError
 from .progress import format_bytes as _format_bytes
 from .progress import print_info as _print_info
 from .progress import render_progress as _render_progress
+from .scheduling import DownloadConcurrency, load_resume_ranges, split_download_ranges
 
 
 def _available_worker_count() -> int:
@@ -58,7 +60,7 @@ def _available_worker_count() -> int:
     return max(1, os.cpu_count() or 1)
 
 
-_DOWNLOAD_THREADS = _available_worker_count()
+_DOWNLOAD_THREADS = _DOWNLOAD_MAX_WORKERS
 _DECRYPT_THREADS = _available_worker_count()
 _CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", re.IGNORECASE)
 
@@ -364,31 +366,17 @@ def _prepare_range_resume_state(
     resume: bool,
     *,
     part_count: int = _DOWNLOAD_THREADS,
+    alignment: int = 1,
 ) -> tuple[list[dict[str, int]], Path]:
     meta_path = _resume_state_path(data_path)
     default_ranges = _build_range_parts(total_size, part_count=part_count)
     ranges = default_ranges
-    if resume and meta_path.is_file():
+    if resume and data_path.is_file() and meta_path.is_file():
         try:
             payload = json.loads(meta_path.read_text(encoding="utf-8"))
-            raw_ranges = payload.get("ranges")
-            if (
-                isinstance(raw_ranges, list)
-                and int(payload.get("size", -1)) == total_size
-                and len(raw_ranges) == len(default_ranges)
-            ):
-                loaded: list[dict[str, int]] = []
-                valid = True
-                for raw, default in zip(raw_ranges, default_ranges):
-                    start = int(raw.get("start", -1))
-                    end = int(raw.get("end", -1))
-                    offset = int(raw.get("offset", start))
-                    if start != default["start"] or end != default["end"]:
-                        valid = False
-                        break
-                    loaded.append({"start": start, "end": end, "offset": max(start, min(end + 1, offset))})
-                if valid:
-                    ranges = loaded
+            loaded = load_resume_ranges(payload, total_size, data_path.stat().st_size, alignment=alignment)
+            if loaded is not None:
+                ranges = loaded
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
             ranges = default_ranges
 
@@ -1244,6 +1232,7 @@ def decrypt_firmware(
         length,
         resume,
         part_count=worker_count,
+        alignment=_AES_BLOCK_SIZE,
     )
 
     done = _resume_done_bytes(ranges)
@@ -1264,7 +1253,7 @@ def decrypt_firmware(
             with done_lock:
                 item["offset"] = end + 1
 
-    with ThreadPoolExecutor(max_workers=len(ranges) or 1) as executor:
+    with ThreadPoolExecutor(max_workers=min(worker_count, len(ranges)) or 1) as executor:
         futures = [executor.submit(worker, item) for item in ranges]
         last_saved = -1
         while True:
@@ -1344,8 +1333,13 @@ def _download_ranges_parallel(
     decrypt_key: bytes | None = None,
     recover_download: Callable[[], None] | None = None,
     rate_limiter: BandwidthLimiter | None = None,
+    workers: int | None = None,
 ) -> None:
+    if workers is not None and workers <= 0:
+        raise ValueError("threads must be positive")
+    ranges[:] = split_download_ranges(ranges)
     state_lock = threading.Lock()
+    scheduling_changed = threading.Condition(state_lock)
     stop_event = threading.Event()
     errors: list[Exception] = []
     started_at = time.monotonic()
@@ -1355,6 +1349,16 @@ def _download_ranges_parallel(
     initial_done = _resume_done_bytes(ranges)
     recovery_lock = threading.Lock()
     worker_finished = threading.Event()
+    pending_ranges = deque(idx for idx, item in enumerate(ranges) if item["offset"] <= item["end"])
+    worker_limit = min(workers if workers is not None else _DOWNLOAD_THREADS, len(pending_ranges))
+    concurrency = DownloadConcurrency(
+        worker_limit,
+        adaptive=workers is None,
+        now=started_at,
+        done=initial_done,
+        rate_limit=rate_limiter.rate if rate_limiter is not None else 0,
+    )
+    active_workers = 0
     chunk_size = _DOWNLOAD_CHUNK_SIZE
     if rate_limiter is not None and rate_limiter.rate > 0:
         chunk_size = min(chunk_size, max(_AES_BLOCK_SIZE, int(rate_limiter.rate * _PROGRESS_REFRESH_S)))
@@ -1435,6 +1439,9 @@ def _download_ranges_parallel(
                         )
                     return
                 except (requests.RequestException, OSError, RetryableDownloadError) as exc:
+                    with scheduling_changed:
+                        concurrency.backoff(time.monotonic(), _resume_done_bytes(ranges))
+                        scheduling_changed.notify_all()
                     attempts += 1
                     if attempts > _DOWNLOAD_RETRIES:
                         stop_event.set()
@@ -1450,8 +1457,10 @@ def _download_ranges_parallel(
                             with state_lock:
                                 errors.append(FUSError(f"download recovery failed: {recovery_exc}"))
                             return
-                        time.sleep(_RATE_LIMIT_COOLDOWN_S)
-                    time.sleep(_RETRY_BACKOFF_S * attempts)
+                        if stop_event.wait(_RATE_LIMIT_COOLDOWN_S):
+                            return
+                    if stop_event.wait(_RETRY_BACKOFF_S * attempts):
+                        return
                 except Exception as exc:
                     stop_event.set()
                     with state_lock:
@@ -1461,34 +1470,49 @@ def _download_ranges_parallel(
                     if response is not None:
                         response.close()
 
-    def run_worker(range_idx: int) -> None:
+    def run_worker() -> None:
+        nonlocal active_workers
         try:
-            worker(range_idx)
+            while True:
+                with scheduling_changed:
+                    scheduling_changed.wait_for(
+                        lambda: stop_event.is_set() or not pending_ranges or active_workers < concurrency.target
+                    )
+                    if stop_event.is_set() or not pending_ranges:
+                        return
+                    range_idx = pending_ranges.popleft()
+                    active_workers += 1
+                try:
+                    worker(range_idx)
+                finally:
+                    with scheduling_changed:
+                        active_workers -= 1
+                        scheduling_changed.notify_all()
+                    worker_finished.set()
         except Exception as exc:
-            with state_lock:
+            with scheduling_changed:
                 errors.append(exc)
-            stop_event.set()
+                stop_event.set()
+                scheduling_changed.notify_all()
         finally:
             worker_finished.set()
 
-    threads = [
-        threading.Thread(target=run_worker, args=(idx,), daemon=True)
-        for idx, segment in enumerate(ranges)
-        if int(segment["offset"]) <= int(segment["end"])
-    ]
-    for index, thread in enumerate(threads):
-        thread.start()
-        if index + 1 < len(threads):
-            time.sleep(_THREAD_STAGGER_S)
-
+    threads: list[threading.Thread] = []
     try:
+        _save_range_resume_state(meta_path, total_size, ranges)
+        for _ in range(worker_limit):
+            thread = threading.Thread(target=run_worker, daemon=True)
+            thread.start()
+            threads.append(thread)
         while any(thread.is_alive() for thread in threads):
             worker_finished.clear()
             now = time.monotonic()
-            with state_lock:
+            with scheduling_changed:
                 done = _resume_done_bytes(ranges)
                 err = errors[0] if errors else None
                 snapshot = [dict(item) for item in ranges]
+                concurrency.sample(now, done, pending=bool(pending_ranges))
+                scheduling_changed.notify_all()
             _render_progress(
                 "Downloading",
                 done,
@@ -1508,15 +1532,18 @@ def _download_ranges_parallel(
             if any(thread.is_alive() for thread in threads):
                 worker_finished.wait(_PROGRESS_REFRESH_S)
     finally:
-        stop_event.set()
+        with scheduling_changed:
+            stop_event.set()
+            scheduling_changed.notify_all()
         for thread in threads:
             thread.join()
+        with state_lock:
+            snapshot = [dict(item) for item in ranges]
+        _save_range_resume_state(meta_path, total_size, snapshot)
 
     with state_lock:
         done = _resume_done_bytes(ranges)
         err = errors[0] if errors else None
-        snapshot = [dict(item) for item in ranges]
-    _save_range_resume_state(meta_path, total_size, snapshot)
     _render_progress(
         "Downloading",
         done,
@@ -1574,7 +1601,8 @@ def download_firmware(
         temp_path,
         info.size,
         resume,
-        part_count=worker_count,
+        part_count=1,
+        alignment=_AES_BLOCK_SIZE if auto_decrypt else 1,
     )
     done_before = _resume_done_bytes(ranges)
 
@@ -1605,6 +1633,7 @@ def download_firmware(
                 ranges=ranges,
                 recover_download=recover_download,
                 rate_limiter=limiter,
+                workers=worker_count if threads is not None else None,
             )
         meta_path.unlink(missing_ok=True)
         return DownloadResult(temp_path, None, firmware, info.filename, info.size)
@@ -1620,6 +1649,7 @@ def download_firmware(
             decrypt_key=decrypt_key,
             recover_download=recover_download,
             rate_limiter=limiter,
+            workers=worker_count if threads is not None else None,
         )
     meta_path.unlink(missing_ok=True)
     final_stream_path = _finalize_stream_decrypted_file(temp_path, final_path)
