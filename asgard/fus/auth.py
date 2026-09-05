@@ -11,14 +11,14 @@ from http.cookies import CookieError, SimpleCookie
 import requests
 from Cryptodome.Cipher import AES
 
-from ..constants import (
+from ..core.constants import (
     _AES_BLOCK_SIZE,
     _AUTH_AES_KEY,
     _AUTH_NONCE_COUNT,
     _AUTH_SIGNATURE_ALPHABET,
     _FUS_USER_AGENT,
 )
-from ..errors import FUSError
+from ..core.errors import FUSError
 
 
 def _md5_hexdigest(text: str) -> str:

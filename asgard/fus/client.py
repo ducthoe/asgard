@@ -9,12 +9,8 @@ import xml.etree.ElementTree as ET
 
 import requests
 
-from ..constants import (
-    _FUS_BASE_URL,
-    _FUS_DOWNLOAD_URL,
-    _RETRY_BACKOFF_S,
-)
-from ..errors import FUSError, RetryableDownloadError
+from ..core.constants import _FUS_BASE_URL, _FUS_DOWNLOAD_URL, _RETRY_BACKOFF_S
+from ..core.errors import FUSError, RetryableDownloadError
 from .auth import FUSAuth
 from .protocol import _xml_text
 

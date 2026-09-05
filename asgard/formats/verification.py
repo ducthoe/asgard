@@ -13,7 +13,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import BinaryIO
 
-from .constants import (
+from ..core.constants import (
     _HASH_CHUNK_SIZE,
     _HASH_PARALLEL_MIN_SIZE,
     _SPARSE_CHUNK_HEADER,
@@ -24,7 +24,7 @@ from .constants import (
     _SPARSE_MAGIC,
     _SPARSE_RAW,
 )
-from .errors import FUSError
+from ..core.errors import FUSError
 
 
 def _hash_file(path: Path) -> tuple[str, str]:

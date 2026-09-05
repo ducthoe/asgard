@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-from ..errors import FUSError as FUSError
-from ..errors import RetryableDownloadError as RetryableDownloadError
+from ..core.errors import FUSError as FUSError
+from ..core.errors import RetryableDownloadError as RetryableDownloadError
 from .auth import decrypt_nonce as decrypt_nonce
 from .auth import get_logic_check as get_logic_check
 from .client import FUSClient as FUSClient

@@ -6,10 +6,8 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
-from ..constants import (
-    _LATEST_HISTORY_IGNORED_INDEXES,
-)
-from ..errors import FUSError
+from ..core.constants import _LATEST_HISTORY_IGNORED_INDEXES
+from ..core.errors import FUSError
 from .client import FUSClient
 from .models import BinaryInfo, FirmwareHistoryEntry
 from .protocol import (

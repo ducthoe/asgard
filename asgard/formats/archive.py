@@ -18,15 +18,17 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterator, TypeVar
 
-from . import fus as _fus
-from .constants import (
+from .. import fus as _fus
+from ..cli.progress import format_bytes, print_info
+from ..core.constants import (
     _ARCHIVE_COPY_CHUNK_SIZE,
     _TAR_INDEX_MEMBER_BUFFER_SIZE,
     _TAR_INDEX_SCAN_BUFFER_SIZE,
     _TAR_INDEX_SPACING,
     _TAR_INDEX_VERSION,
 )
-from .errors import FUSError, StreamSourceError
+from ..core.errors import FUSError, StreamSourceError
+from ..core.streaming import copy_stream_with_progress, open_prefetched_stream
 from .images import (
     FirmwareSuperPartition,
     copy_image_stream,
@@ -34,8 +36,6 @@ from .images import (
     extract_super_partitions,
     list_super_partitions,
 )
-from .progress import format_bytes, print_info
-from .streaming import copy_stream_with_progress, open_prefetched_stream
 
 __all__ = [
     "FirmwareArchiveEntry",

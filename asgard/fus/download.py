@@ -13,7 +13,10 @@ from typing import Callable
 import requests
 from Cryptodome.Cipher import AES
 
-from ..constants import (
+from ..cli.progress import format_bytes as _format_bytes
+from ..cli.progress import print_info as _print_info
+from ..cli.progress import render_progress as _render_progress
+from ..core.constants import (
     _AES_BLOCK_SIZE,
     _DOWNLOAD_CHUNK_SIZE,
     _DOWNLOAD_RECOVERY_INTERVAL,
@@ -23,11 +26,7 @@ from ..constants import (
     _RESUME_META_SAVE_INTERVAL_S,
     _RETRY_BACKOFF_S,
 )
-from ..errors import FUSError, RetryableDownloadError
-from ..progress import format_bytes as _format_bytes
-from ..progress import print_info as _print_info
-from ..progress import render_progress as _render_progress
-from ..scheduling import split_download_ranges
+from ..core.errors import FUSError, RetryableDownloadError
 from .client import FUSClient
 from .crypto import _decryption_key_from_info, _pkcs7_unpad, decrypted_output_path
 from .firmware import _resolve_versioned_info, initialize_download
@@ -41,6 +40,7 @@ from .resume import (
     _resume_state_path,
     _save_range_resume_state,
 )
+from .scheduling import split_download_ranges
 from .streaming import BandwidthLimiter, _validate_content_range
 
 

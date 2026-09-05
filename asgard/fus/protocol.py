@@ -5,11 +5,8 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 
-from ..constants import (
-    _AES_BLOCK_SIZE,
-    _FUS_PLACEHOLDER,
-)
-from ..errors import FUSError
+from ..core.constants import _AES_BLOCK_SIZE, _FUS_PLACEHOLDER
+from ..core.errors import FUSError
 from .auth import get_logic_check
 
 

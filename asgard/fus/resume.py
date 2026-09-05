@@ -6,11 +6,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ..constants import (
-    _AES_BLOCK_SIZE,
-    _DOWNLOAD_WORKERS,
-)
-from ..scheduling import load_resume_ranges
+from ..core.constants import _AES_BLOCK_SIZE, _DOWNLOAD_WORKERS
+from .scheduling import load_resume_ranges
 
 _DOWNLOAD_THREADS = _DOWNLOAD_WORKERS
 

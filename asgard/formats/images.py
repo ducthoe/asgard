@@ -12,7 +12,8 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from .constants import (
+from ..cli.progress import render_progress
+from ..core.constants import (
     _ARCHIVE_COPY_CHUNK_SIZE,
     _LP_BLOCK_DEVICE,
     _LP_EXTENT,
@@ -41,16 +42,15 @@ from .constants import (
     _PROGRESS_REFRESH_S,
     _SPARSE_MAGIC,
 )
-from .errors import FUSError, StreamSourceError
-from .progress import render_progress
-from .sparse_format import _copy_sparse_stream, _SparseRawReader
-from .streaming import (
+from ..core.errors import FUSError, StreamSourceError
+from ..core.streaming import (
     copy_stream_with_progress,
     open_prefetched_stream,
     read_exact_stream,
     write_data_or_hole,
     write_data_or_holes,
 )
+from .sparse_format import _copy_sparse_stream, _SparseRawReader
 
 
 @dataclass(frozen=True, slots=True)

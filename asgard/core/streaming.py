@@ -11,12 +11,9 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 
-from .constants import (
-    _ARCHIVE_COPY_CHUNK_SIZE,
-    _PROGRESS_REFRESH_S,
-)
+from ..cli.progress import render_progress
+from .constants import _ARCHIVE_COPY_CHUNK_SIZE, _PROGRESS_REFRESH_S
 from .errors import FUSError
-from .progress import render_progress
 
 _ZERO_DATA = bytes(_ARCHIVE_COPY_CHUNK_SIZE)
 

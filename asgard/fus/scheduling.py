@@ -3,12 +3,7 @@
 
 from __future__ import annotations
 
-from .constants import (
-    _AES_BLOCK_SIZE,
-    _DOWNLOAD_MIN_RANGE_SIZE,
-    _DOWNLOAD_RANGE_SIZE,
-    _DOWNLOAD_WORKERS,
-)
+from ..core.constants import _AES_BLOCK_SIZE, _DOWNLOAD_MIN_RANGE_SIZE, _DOWNLOAD_RANGE_SIZE, _DOWNLOAD_WORKERS
 
 
 def split_download_ranges(ranges: list[dict[str, int]], *, workers: int = _DOWNLOAD_WORKERS) -> list[dict[str, int]]:

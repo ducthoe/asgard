@@ -10,7 +10,8 @@ import time
 import zlib
 from functools import lru_cache
 
-from .constants import (
+from ..cli.progress import render_progress
+from ..core.constants import (
     _ARCHIVE_COPY_CHUNK_SIZE,
     _MAX_SIGNED_64,
     _PROGRESS_REFRESH_S,
@@ -22,9 +23,8 @@ from .constants import (
     _SPARSE_MAGIC,
     _SPARSE_RAW,
 )
-from .errors import FUSError
-from .progress import render_progress
-from .streaming import read_exact_stream, write_data_or_hole, write_data_or_holes
+from ..core.errors import FUSError
+from ..core.streaming import read_exact_stream, write_data_or_hole, write_data_or_holes
 
 _CRC32_BYTE_OPERATOR = tuple(zlib.crc32(b"\0", 1 << bit) ^ zlib.crc32(b"\0") for bit in range(32))
 

@@ -8,7 +8,7 @@ import os
 import secrets
 from pathlib import Path
 
-from .errors import FUSError
+from ..core.errors import FUSError
 
 
 def config_dir() -> Path:

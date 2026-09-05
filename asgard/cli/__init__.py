@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-__version__ = "3.0.0"
 
-from .core.errors import FUSError
+def main(argv: list[str] | None = None) -> int:
+    from .app import main as run
 
-__all__ = ["FUSError", "__version__"]
+    return run(argv)

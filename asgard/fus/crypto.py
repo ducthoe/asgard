@@ -13,12 +13,9 @@ from typing import Callable
 
 from Cryptodome.Cipher import AES
 
-from ..constants import (
-    _AES_BLOCK_SIZE,
-    _PROGRESS_REFRESH_S,
-)
-from ..errors import FUSError
-from ..progress import render_progress as _render_progress
+from ..cli.progress import render_progress as _render_progress
+from ..core.constants import _AES_BLOCK_SIZE, _PROGRESS_REFRESH_S
+from ..core.errors import FUSError
 from .auth import get_logic_check
 from .client import FUSClient
 from .firmware import _resolve_versioned_info

@@ -10,12 +10,13 @@ import textwrap
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import __version__, settings
-from .errors import FUSError, report_error
+from .. import __version__
+from ..core.errors import FUSError, report_error
+from . import settings
 from .progress import format_bytes, set_quiet
 
 if TYPE_CHECKING:
-    from . import fus
+    from .. import fus
 
 _HISTORY_WRAP_WIDTH = 100
 _FIRMWARE_HELP = "Firmware version to use, for example S721BXXSACZB2/S721BOXMACZB2/S721BXXSACZB2/S721BXXSACZB2"
@@ -169,7 +170,7 @@ def _write_output_manifests(
 ) -> list[dict[str, object]]:
     if option is None:
         return []
-    from .verification import write_manifest
+    from ..formats.verification import write_manifest
 
     if option and len(paths) != 1:
         raise ValueError("an explicit --manifest path requires exactly one output file")
@@ -322,7 +323,7 @@ def _history_diff(a: fus.FirmwareHistoryEntry, b: fus.FirmwareHistoryEntry) -> d
 
 
 def _select_history(rows: list[fus.FirmwareHistoryEntry], version: str | None, label: str) -> fus.FirmwareHistoryEntry:
-    from . import fus
+    from .. import fus
 
     if not rows:
         raise FUSError(f"no firmware history returned for {label}")
@@ -337,7 +338,7 @@ def _select_history(rows: list[fus.FirmwareHistoryEntry], version: str | None, l
 
 
 def _handle_compare(args: argparse.Namespace) -> int:
-    from . import fus
+    from .. import fus
 
     model = args.model.upper()
     region_a, region_b = args.region_a.upper(), args.region_b.upper()
@@ -395,7 +396,7 @@ def _load_batch(path_value: str) -> list[dict[str, Any]]:
 
 
 def _handle_batch(args: argparse.Namespace) -> int:
-    from . import fus
+    from .. import fus
 
     jobs = _load_batch(args.file)
     results: list[dict[str, object]] = []
@@ -462,7 +463,8 @@ def _handle_batch(args: argparse.Namespace) -> int:
 
 
 def _handle_download(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    from . import archive, fus
+    from .. import fus
+    from ..formats import archive
 
     model, region = _resolve_args_device(args)
     common = {
@@ -615,7 +617,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "profile":
             return _handle_profiles(args)
         if args.command == "verify":
-            from .verification import verify_file
+            from ..formats.verification import verify_file
 
             result = verify_file(args.file, include_entries=not args.no_entries)
             if args.json:
@@ -628,7 +630,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"entries: {result['entry_count']}")
             return 0
         if args.command == "manifest":
-            from .verification import write_manifest
+            from ..formats.verification import write_manifest
 
             metadata = {
                 key: value
@@ -644,7 +646,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         import requests
 
-        from . import fus
+        from .. import fus
 
         request_errors = (requests.RequestException,)
         if args.command == "compare":

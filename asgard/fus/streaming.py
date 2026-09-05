@@ -13,7 +13,7 @@ from typing import Callable, Iterator
 import requests
 from Cryptodome.Cipher import AES
 
-from ..constants import (
+from ..core.constants import (
     _AES_BLOCK_SIZE,
     _ARCHIVE_TAIL_CACHE_SIZE,
     _DOWNLOAD_RECOVERY_INTERVAL,
@@ -22,7 +22,7 @@ from ..constants import (
     _RATE_LIMIT_COOLDOWN_S,
     _RETRY_BACKOFF_S,
 )
-from ..errors import FUSError, RetryableDownloadError
+from ..core.errors import FUSError, RetryableDownloadError
 from .client import FUSClient
 from .crypto import _pkcs7_unpad
 
