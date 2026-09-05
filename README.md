@@ -327,7 +327,7 @@ Bug reports and pull requests are welcome. Before submitting a change, run the
 configured linter:
 
 ```console
-ruff check --config configs/ruff.toml asgard
+ruff check asgard
 ```
 
 ## License

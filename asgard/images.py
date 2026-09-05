@@ -5,19 +5,45 @@ from __future__ import annotations
 
 import hashlib
 import io
-import os
-import re
 import struct
 import time
-import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from .constants import _ARCHIVE_COPY_CHUNK_SIZE, _PROGRESS_REFRESH_S
+from .constants import (
+    _ARCHIVE_COPY_CHUNK_SIZE,
+    _LP_BLOCK_DEVICE,
+    _LP_EXTENT,
+    _LP_GEOMETRY,
+    _LP_GEOMETRY_MAGIC,
+    _LP_GEOMETRY_SIZE,
+    _LP_GROUP,
+    _LP_HEADER_MAGIC,
+    _LP_HEADER_PREFIX,
+    _LP_HEADER_V1_0_SIZE,
+    _LP_HEADER_V1_2_SIZE,
+    _LP_MAJOR_VERSION,
+    _LP_MAX_MINOR_VERSION,
+    _LP_MAX_TABLES_SIZE,
+    _LP_NAME_RE,
+    _LP_PARTITION,
+    _LP_PARTITION_ATTRIBUTES_V0,
+    _LP_PARTITION_ATTRIBUTES_V1,
+    _LP_PARTITION_SLOT_SUFFIXED,
+    _LP_RESERVED_BYTES,
+    _LP_SECTOR_SIZE,
+    _LP_TABLE_DESCRIPTOR,
+    _LP_TARGET_LINEAR,
+    _LP_TARGET_ZERO,
+    _MAX_SIGNED_64,
+    _PROGRESS_REFRESH_S,
+    _SPARSE_MAGIC,
+)
 from .errors import FUSError, StreamSourceError
 from .progress import render_progress
+from .sparse_format import _copy_sparse_stream, _SparseRawReader
 from .streaming import (
     copy_stream_with_progress,
     open_prefetched_stream,
@@ -25,38 +51,6 @@ from .streaming import (
     write_data_or_hole,
     write_data_or_holes,
 )
-
-_SPARSE_HEADER = struct.Struct("<I4H4I")
-_SPARSE_CHUNK_HEADER = struct.Struct("<2H2I")
-_SPARSE_MAGIC = 0xED26FF3A
-_SPARSE_RAW = 0xCAC1
-_SPARSE_FILL = 0xCAC2
-_SPARSE_DONT_CARE = 0xCAC3
-_SPARSE_CRC32 = 0xCAC4
-_LP_GEOMETRY = struct.Struct("<II32sIII")
-_LP_HEADER_PREFIX = struct.Struct("<IHHI32sI32s")
-_LP_TABLE_DESCRIPTOR = struct.Struct("<III")
-_LP_PARTITION = struct.Struct("<36sIIII")
-_LP_EXTENT = struct.Struct("<QIQI")
-_LP_GROUP = struct.Struct("<36sIQ")
-_LP_BLOCK_DEVICE = struct.Struct("<QIIQ36sI")
-_LP_GEOMETRY_MAGIC = 0x616C4467
-_LP_HEADER_MAGIC = 0x414C5030
-_LP_MAJOR_VERSION = 10
-_LP_MAX_MINOR_VERSION = 2
-_LP_HEADER_V1_0_SIZE = 128
-_LP_HEADER_V1_2_SIZE = 256
-_LP_RESERVED_BYTES = 4096
-_LP_GEOMETRY_SIZE = 4096
-_LP_SECTOR_SIZE = 512
-_LP_TARGET_LINEAR = 0
-_LP_TARGET_ZERO = 1
-_LP_PARTITION_SLOT_SUFFIXED = 1 << 1
-_LP_PARTITION_ATTRIBUTES_V0 = (1 << 0) | _LP_PARTITION_SLOT_SUFFIXED
-_LP_PARTITION_ATTRIBUTES_V1 = (1 << 2) | (1 << 3)
-_LP_NAME_RE = re.compile(r"[A-Za-z0-9_]+\Z")
-_LP_MAX_TABLES_SIZE = 16 * 1024 * 1024
-_MAX_SIGNED_64 = (1 << 63) - 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,224 +182,6 @@ class _RawForwardReader:
             raise FUSError("raw image stream did not reach its declared size")
         if require_eof and self._source.read(1):
             raise FUSError("raw image contains trailing data")
-
-
-class _SparseRawReader:
-    def __init__(self, source: io.BufferedIOBase, *, header_prefix: bytes):
-        self._source = source
-        header = header_prefix + read_exact_stream(
-            source,
-            _SPARSE_HEADER.size - len(header_prefix),
-            "sparse image header",
-        )
-        (
-            magic,
-            major_version,
-            _minor_version,
-            self._file_header_size,
-            self._chunk_header_size,
-            self._block_size,
-            self._total_blocks,
-            self._total_chunks,
-            self._image_checksum,
-        ) = _SPARSE_HEADER.unpack(header)
-        if magic != _SPARSE_MAGIC:
-            raise FUSError("invalid sparse image magic")
-        if major_version != 1:
-            raise FUSError(f"unsupported sparse image version: {major_version}")
-        if self._file_header_size < _SPARSE_HEADER.size:
-            raise FUSError(f"invalid sparse file header size: {self._file_header_size}")
-        if self._chunk_header_size < _SPARSE_CHUNK_HEADER.size:
-            raise FUSError(f"invalid sparse chunk header size: {self._chunk_header_size}")
-        if self._block_size <= 0 or self._block_size % 4:
-            raise FUSError(f"invalid sparse block size: {self._block_size}")
-        if not self._total_blocks:
-            raise FUSError("sparse image contains no output blocks")
-        self.raw_size = self._block_size * self._total_blocks
-        if self.raw_size > _MAX_SIGNED_64:
-            raise FUSError(f"sparse image is too large: {self.raw_size} bytes")
-        if self._file_header_size > _SPARSE_HEADER.size:
-            read_exact_stream(
-                source,
-                self._file_header_size - _SPARSE_HEADER.size,
-                "extended sparse header",
-            )
-
-        self._position = 0
-        self._blocks_seen = 0
-        self._chunks_seen = 0
-        self._checksum = 0
-        self._chunk_type: int | None = None
-        self._chunk_remaining = 0
-        self._chunk_pattern = b""
-        self._pattern_offset = 0
-        self._finished = False
-
-    def tell(self) -> int:
-        return self._position
-
-    def _validate_end(self) -> None:
-        if self._blocks_seen != self._total_blocks:
-            raise FUSError(f"incomplete sparse image: expected {self._total_blocks} blocks, got {self._blocks_seen}")
-        if self._image_checksum and self._image_checksum != self._checksum:
-            raise FUSError(
-                f"sparse image checksum mismatch: expected {self._image_checksum:08x}, got {self._checksum:08x}"
-            )
-        self._finished = True
-
-    def _load_next_chunk(self) -> bool:
-        while self._chunks_seen < self._total_chunks:
-            chunk_number = self._chunks_seen + 1
-            raw_header = read_exact_stream(
-                self._source,
-                self._chunk_header_size,
-                f"sparse chunk {chunk_number} header",
-            )
-            self._chunks_seen += 1
-            chunk_type, _reserved, chunk_blocks, total_size = _SPARSE_CHUNK_HEADER.unpack_from(raw_header)
-            if total_size < self._chunk_header_size:
-                raise FUSError(f"invalid sparse chunk {chunk_number} size: {total_size}")
-            data_size = total_size - self._chunk_header_size
-
-            if chunk_type == _SPARSE_CRC32:
-                if chunk_blocks != 0 or data_size != 4:
-                    raise FUSError(f"invalid sparse CRC chunk {chunk_number}")
-                expected = struct.unpack(
-                    "<I",
-                    read_exact_stream(self._source, 4, "sparse CRC32"),
-                )[0]
-                if expected != self._checksum:
-                    raise FUSError(f"sparse CRC mismatch: expected {expected:08x}, got {self._checksum:08x}")
-                continue
-
-            if chunk_blocks > self._total_blocks - self._blocks_seen:
-                raise FUSError(f"sparse chunk {chunk_number} exceeds the output size")
-            chunk_size = chunk_blocks * self._block_size
-            self._blocks_seen += chunk_blocks
-            if chunk_type == _SPARSE_RAW:
-                if data_size != chunk_size:
-                    raise FUSError(f"invalid sparse RAW chunk {chunk_number}")
-                pattern = b""
-            elif chunk_type == _SPARSE_FILL:
-                if data_size != 4:
-                    raise FUSError(f"invalid sparse FILL chunk {chunk_number}")
-                pattern = read_exact_stream(self._source, 4, "sparse fill pattern")
-            elif chunk_type == _SPARSE_DONT_CARE:
-                if data_size != 0:
-                    raise FUSError(f"invalid sparse DONT_CARE chunk {chunk_number}")
-                pattern = b"\0\0\0\0"
-            else:
-                raise FUSError(f"unknown sparse chunk type: 0x{chunk_type:04x}")
-
-            if not chunk_size:
-                continue
-            self._chunk_type = chunk_type
-            self._chunk_remaining = chunk_size
-            self._chunk_pattern = pattern
-            self._pattern_offset = 0
-            return True
-
-        self._validate_end()
-        return False
-
-    @staticmethod
-    def _repeated_data(pattern: bytes, offset: int, size: int) -> bytes:
-        repeats = (offset + size + len(pattern) - 1) // len(pattern)
-        return (pattern * repeats)[offset : offset + size]
-
-    def _consume(
-        self,
-        size: int,
-        *,
-        output: io.BufferedWriter | None = None,
-        collect: bool = False,
-        hole_block_size: int | None = None,
-    ) -> bytes:
-        if size < 0:
-            raise ValueError("read size cannot be negative")
-        if size > self.raw_size - self._position:
-            raise FUSError("read exceeds the sparse image raw size")
-        collected: list[bytes] = []
-        remaining = size
-        while remaining:
-            if not self._chunk_remaining and not self._load_next_chunk():
-                raise FUSError("unexpected end of sparse image")
-            amount = min(remaining, self._chunk_remaining, _ARCHIVE_COPY_CHUNK_SIZE)
-            if self._chunk_type == _SPARSE_RAW:
-                data = read_exact_stream(self._source, amount, "sparse RAW data")
-            else:
-                data = self._repeated_data(self._chunk_pattern, self._pattern_offset, amount)
-
-            if output is not None:
-                if self._chunk_type == _SPARSE_DONT_CARE:
-                    output.seek(len(data), os.SEEK_CUR)
-                elif hole_block_size and self._chunk_type == _SPARSE_RAW:
-                    write_data_or_holes(output, data, hole_block_size)
-                else:
-                    write_data_or_hole(output, data)
-            if collect:
-                collected.append(data)
-            self._checksum = zlib.crc32(data, self._checksum)
-            self._position += amount
-            self._chunk_remaining -= amount
-            self._pattern_offset = (self._pattern_offset + amount) % 4
-            remaining -= amount
-        return b"".join(collected)
-
-    def read(self, size: int = -1) -> bytes:
-        if size is None or size < 0:
-            raise ValueError("a bounded read size is required")
-        return self._consume(min(size, self.raw_size - self._position), collect=True)
-
-    def skip_to(self, offset: int) -> None:
-        if offset < self._position:
-            raise FUSError("super image stream cannot seek backward")
-        self._consume(offset - self._position)
-
-    def copy_to(
-        self,
-        output: io.BufferedWriter,
-        size: int,
-        *,
-        hole_block_size: int | None = None,
-    ) -> None:
-        self._consume(
-            size,
-            output=output,
-            hole_block_size=hole_block_size or self._block_size,
-        )
-
-    def finish(self, *, require_eof: bool) -> None:
-        self.skip_to(self.raw_size)
-        if not self._finished:
-            self._load_next_chunk()
-        if require_eof and self._source.read(1):
-            raise FUSError("sparse image contains trailing data")
-
-
-def _copy_sparse_stream(
-    source: io.BufferedIOBase,
-    output: io.BufferedWriter,
-    *,
-    header_prefix: bytes,
-    label: str,
-) -> int:
-    reader = _SparseRawReader(source, header_prefix=header_prefix)
-    started_at = time.monotonic()
-    last_render = 0.0
-    remaining = reader.raw_size
-    while remaining:
-        amount = min(remaining, _ARCHIVE_COPY_CHUNK_SIZE)
-        reader.copy_to(output, amount)
-        remaining -= amount
-        now = time.monotonic()
-        if now - last_render >= _PROGRESS_REFRESH_S and reader.tell() < reader.raw_size:
-            render_progress(label, reader.tell(), reader.raw_size, started_at)
-            last_render = now
-    reader.finish(require_eof=True)
-    output.truncate(reader.raw_size)
-    render_progress(label, reader.raw_size, reader.raw_size, started_at, complete=True)
-    return reader.raw_size
 
 
 def copy_image_stream(

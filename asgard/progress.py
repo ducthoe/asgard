@@ -15,10 +15,6 @@ def set_quiet(quiet: bool) -> None:
     _QUIET = bool(quiet)
 
 
-def is_quiet() -> bool:
-    return _QUIET
-
-
 def print_info(message: str) -> None:
     if _QUIET:
         return

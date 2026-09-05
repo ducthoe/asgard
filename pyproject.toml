@@ -23,3 +23,12 @@ asgard = "asgard.cli:main"
 
 [tool.setuptools]
 packages = ["asgard"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+extend-select = ["A", "FA100", "FA102", "I"]
+
+[tool.ruff.format]
+quote-style = "double"

@@ -27,6 +27,7 @@ from .constants import (
     _AUTH_AES_KEY,
     _AUTH_NONCE_COUNT,
     _AUTH_SIGNATURE_ALPHABET,
+    _DOWNLOAD_CHUNK_SIZE,
     _DOWNLOAD_RECOVERY_INTERVAL,
     _DOWNLOAD_RETRIES,
     _FUS_BASE_URL,
@@ -63,8 +64,6 @@ _CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", re.IGNORECASE)
 
 
 class BandwidthLimiter:
-    """A thread-safe aggregate byte-rate limiter."""
-
     def __init__(self, bytes_per_second: int | None):
         self.rate = int(bytes_per_second or 0)
         if self.rate < 0:
@@ -1173,19 +1172,25 @@ def _decrypt_range(
     progress: Callable[[int], None] | None = None,
 ) -> None:
     cipher = AES.new(key, AES.MODE_ECB)
+    encrypted = bytearray(1024 * 1024)
+    decrypted = bytearray(len(encrypted))
+    encrypted_view = memoryview(encrypted)
+    decrypted_view = memoryview(decrypted)
     with in_path.open("rb") as inf, out_path.open("r+b") as outf:
         inf.seek(start)
         outf.seek(start)
         remaining = end - start + 1
         while remaining > 0:
-            chunk_size = min(1024 * 1024, remaining)
+            chunk_size = min(len(encrypted), remaining)
             chunk_size -= chunk_size % _AES_BLOCK_SIZE
             if chunk_size == 0:
                 chunk_size = remaining
-            data = inf.read(chunk_size)
-            if len(data) != chunk_size:
+            data = encrypted_view[:chunk_size]
+            if inf.readinto(data) != chunk_size:
                 raise FUSError("unexpected end of encrypted input")
-            outf.write(cipher.decrypt(data))
+            plain = decrypted_view[:chunk_size]
+            cipher.decrypt(data, output=plain)
+            outf.write(plain)
             remaining -= chunk_size
             if progress is not None:
                 progress(chunk_size)
@@ -1349,11 +1354,17 @@ def _download_ranges_parallel(
     meta_path = _resume_state_path(out_path)
     initial_done = _resume_done_bytes(ranges)
     recovery_lock = threading.Lock()
+    worker_finished = threading.Event()
+    chunk_size = _DOWNLOAD_CHUNK_SIZE
+    if rate_limiter is not None and rate_limiter.rate > 0:
+        chunk_size = min(chunk_size, max(_AES_BLOCK_SIZE, int(rate_limiter.rate * _PROGRESS_REFRESH_S)))
 
     def worker(range_idx: int) -> None:
         segment = ranges[range_idx]
         seg_end = int(segment["end"])
         cipher = AES.new(decrypt_key, AES.MODE_ECB) if decrypt_key is not None else None
+        decrypted = bytearray(chunk_size + _AES_BLOCK_SIZE) if cipher is not None else None
+        decrypted_view = memoryview(decrypted) if decrypted is not None else None
         pending = b""
         attempts = 0
         with out_path.open("r+b", buffering=0) as fh:
@@ -1379,7 +1390,7 @@ def _download_ranges_parallel(
                     expected_response_size = seg_end - request_start + 1
                     response_received = 0
                     fh.seek(write_offset)
-                    for chunk in response.iter_content(chunk_size=_RANGE_CHUNK_SIZE):
+                    for chunk in response.iter_content(chunk_size=chunk_size):
                         if stop_event.is_set():
                             return
                         if not chunk:
@@ -1396,16 +1407,17 @@ def _download_ranges_parallel(
                             fh.write(chunk)
                             write_offset += len(chunk)
                         else:
-                            pending += chunk
+                            pending = pending + chunk if pending else chunk
                             block_size = (len(pending) // _AES_BLOCK_SIZE) * _AES_BLOCK_SIZE
                             if block_size:
                                 if block_size > remaining:
                                     raise RetryableDownloadError(
                                         f"range {range_idx + 1} received more data than requested"
                                     )
-                                block = pending[:block_size]
+                                block = memoryview(pending)[:block_size]
                                 pending = pending[block_size:]
-                                plain = cipher.decrypt(block)
+                                plain = decrypted_view[:block_size]
+                                cipher.decrypt(block, output=plain)
                                 fh.write(plain)
                                 write_offset += len(plain)
                         with state_lock:
@@ -1449,7 +1461,21 @@ def _download_ranges_parallel(
                     if response is not None:
                         response.close()
 
-    threads = [threading.Thread(target=worker, args=(idx,), daemon=True) for idx in range(len(ranges))]
+    def run_worker(range_idx: int) -> None:
+        try:
+            worker(range_idx)
+        except Exception as exc:
+            with state_lock:
+                errors.append(exc)
+            stop_event.set()
+        finally:
+            worker_finished.set()
+
+    threads = [
+        threading.Thread(target=run_worker, args=(idx,), daemon=True)
+        for idx, segment in enumerate(ranges)
+        if int(segment["offset"]) <= int(segment["end"])
+    ]
     for index, thread in enumerate(threads):
         thread.start()
         if index + 1 < len(threads):
@@ -1457,6 +1483,7 @@ def _download_ranges_parallel(
 
     try:
         while any(thread.is_alive() for thread in threads):
+            worker_finished.clear()
             now = time.monotonic()
             with state_lock:
                 done = _resume_done_bytes(ranges)
@@ -1478,7 +1505,8 @@ def _download_ranges_parallel(
                 last_meta_save = now
             if err is not None:
                 break
-            time.sleep(_PROGRESS_REFRESH_S)
+            if any(thread.is_alive() for thread in threads):
+                worker_finished.wait(_PROGRESS_REFRESH_S)
     finally:
         stop_event.set()
         for thread in threads:

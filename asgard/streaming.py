@@ -11,9 +11,14 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 
-from .constants import _ARCHIVE_COPY_CHUNK_SIZE, _PROGRESS_REFRESH_S
+from .constants import (
+    _ARCHIVE_COPY_CHUNK_SIZE,
+    _PROGRESS_REFRESH_S,
+)
 from .errors import FUSError
 from .progress import render_progress
+
+_ZERO_DATA = bytes(_ARCHIVE_COPY_CHUNK_SIZE)
 
 
 class _PrefetchReader(io.RawIOBase):
@@ -135,7 +140,13 @@ def read_exact_stream(source: io.BufferedIOBase, size: int, description: str) ->
 
 
 def is_zero_data(data: bytes) -> bool:
-    return not data or (data[0] == 0 and data[-1] == 0 and data.count(0) == len(data))
+    if not data:
+        return True
+    if data[0] or data[-1]:
+        return False
+    if len(data) <= len(_ZERO_DATA):
+        return _ZERO_DATA.startswith(data)
+    return data.count(0) == len(data)
 
 
 def write_data_or_hole(output: io.BufferedWriter, data: bytes) -> None:
@@ -148,6 +159,9 @@ def write_data_or_hole(output: io.BufferedWriter, data: bytes) -> None:
 def write_data_or_holes(output: io.BufferedWriter, data: bytes, block_size: int) -> None:
     if block_size <= 0:
         raise ValueError("hole block size must be positive")
+    if is_zero_data(data):
+        output.seek(len(data), os.SEEK_CUR)
+        return
     if len(data) <= block_size:
         write_data_or_hole(output, data)
         return

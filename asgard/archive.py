@@ -92,8 +92,6 @@ class _TarIndexCache:
 
 
 class _FileWithoutFileno:
-    """Keep indexed-gzip from wrapping a Python-owned descriptor with fdopen."""
-
     def __init__(self, source: io.BufferedIOBase):
         self._source = source
 
@@ -842,6 +840,7 @@ def download_firmware_tar_member(
 
         output_complete = False
         try:
+
             def write_member(member_source: io.BufferedIOBase, member_size: int) -> None:
                 nonlocal source_part_path
                 if not resume:
@@ -854,9 +853,7 @@ def download_firmware_tar_member(
                         keep_sparse=keep_sparse,
                     )
                     return
-                source_part_path = destination.with_name(
-                    f".{destination.name}.{member_size}.asgard-source.part"
-                )
+                source_part_path = destination.with_name(f".{destination.name}.{member_size}.asgard-source.part")
                 _copy_resumable_source(
                     member_source,
                     source_part_path,
@@ -1103,11 +1100,7 @@ def download_firmware_super_partitions(
         )
         with source_part.open("rb") as local_source:
             available = list_super_partitions(local_source, name, size)
-        selected_names = (
-            tuple(partition.name for partition in available)
-            if requested is None
-            else tuple(requested)
-        )
+        selected_names = tuple(partition.name for partition in available) if requested is None else tuple(requested)
         destinations = tuple(output_dir / f"{partition_name}.img" for partition_name in selected_names)
         existing = tuple(path.exists() for path in destinations)
         if destinations and all(existing):

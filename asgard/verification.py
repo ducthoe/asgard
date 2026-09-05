@@ -4,28 +4,31 @@
 from __future__ import annotations
 
 import hashlib
-import struct
 import tarfile
 import zipfile
 from pathlib import Path
 from typing import BinaryIO
 
+from .constants import (
+    _SPARSE_CHUNK_HEADER,
+    _SPARSE_CRC32,
+    _SPARSE_DONT_CARE,
+    _SPARSE_FILL,
+    _SPARSE_HEADER,
+    _SPARSE_MAGIC,
+    _SPARSE_RAW,
+)
 from .errors import FUSError
-
-_SPARSE_HEADER = struct.Struct("<I4H4I")
-_SPARSE_CHUNK = struct.Struct("<2H2I")
-_SPARSE_MAGIC = 0xED26FF3A
-_SPARSE_RAW = 0xCAC1
-_SPARSE_FILL = 0xCAC2
-_SPARSE_DONT_CARE = 0xCAC3
-_SPARSE_CRC32 = 0xCAC4
 
 
 def _hash_file(path: Path) -> tuple[str, str]:
     sha256 = hashlib.sha256()
     md5 = hashlib.md5(usedforsecurity=False)
     with path.open("rb") as source:
-        while chunk := source.read(1024 * 1024):
+        buffer = bytearray(1024 * 1024)
+        view = memoryview(buffer)
+        while size := source.readinto(buffer):
+            chunk = view[:size]
             sha256.update(chunk)
             md5.update(chunk)
     return sha256.hexdigest(), md5.hexdigest()
@@ -47,8 +50,16 @@ def _verify_sparse(path: Path) -> dict[str, object] | None:
             return None
         if len(prefix) != _SPARSE_HEADER.size:
             raise FUSError("truncated Android sparse header")
-        magic, major, minor, file_header_size, chunk_header_size, block_size, total_blocks, total_chunks, checksum = _SPARSE_HEADER.unpack(prefix)
-        if magic != _SPARSE_MAGIC or major != 1 or file_header_size < _SPARSE_HEADER.size or chunk_header_size < _SPARSE_CHUNK.size or block_size <= 0:
+        magic, major, minor, file_header_size, chunk_header_size, block_size, total_blocks, total_chunks, checksum = (
+            _SPARSE_HEADER.unpack(prefix)
+        )
+        if (
+            magic != _SPARSE_MAGIC
+            or major != 1
+            or file_header_size < _SPARSE_HEADER.size
+            or chunk_header_size < _SPARSE_CHUNK_HEADER.size
+            or block_size <= 0
+        ):
             raise FUSError("invalid Android sparse header")
         _skip_exact(source, file_header_size - _SPARSE_HEADER.size, "sparse file header")
         produced_blocks = 0
@@ -56,7 +67,7 @@ def _verify_sparse(path: Path) -> dict[str, object] | None:
             raw = source.read(chunk_header_size)
             if len(raw) != chunk_header_size:
                 raise FUSError(f"truncated sparse chunk {index + 1}")
-            chunk_type, _reserved, chunk_blocks, total_size = _SPARSE_CHUNK.unpack(raw[: _SPARSE_CHUNK.size])
+            chunk_type, _reserved, chunk_blocks, total_size = _SPARSE_CHUNK_HEADER.unpack_from(raw)
             payload_size = total_size - chunk_header_size
             expected = {
                 _SPARSE_RAW: chunk_blocks * block_size,
@@ -168,10 +179,7 @@ def write_manifest(
 
         with source.open("rb") as image_source:
             partitions = list_super_partitions(image_source, source.name, source.stat().st_size)
-        manifest["partitions"] = [
-            {"name": partition.name, "size": partition.size}
-            for partition in partitions
-        ]
+        manifest["partitions"] = [{"name": partition.name, "size": partition.size} for partition in partitions]
     output_path = Path(output).expanduser() if output else source.with_name(f"{source.name}.manifest.json")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_name(f"{output_path.name}.tmp")

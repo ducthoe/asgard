@@ -1,7 +1,7 @@
 # Copyright (C) 2026 ducthoe
 # SPDX-License-Identifier: GPL-3.0-only
 
-from __future__ import annotations
+import sys
 
 
 class FUSError(RuntimeError):
@@ -13,4 +13,18 @@ class RetryableDownloadError(FUSError):
 
 
 class StreamSourceError(Exception):
-    """A cached random-access stream could not be read reliably."""
+    pass
+
+
+def report_error(error: Exception, *, request_failed: bool = False) -> int:
+    if isinstance(error, FileNotFoundError):
+        message = f"file not found: {error}"
+        status = 2
+    elif request_failed:
+        message = f"request failed: {error}"
+        status = 1
+    else:
+        message = str(error)
+        status = 1
+    print(f"error: {message}", file=sys.stderr)
+    return status

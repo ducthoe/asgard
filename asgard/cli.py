@@ -6,27 +6,45 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import sys
 import textwrap
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import requests
-
-from . import __version__, archive, fus, settings
-from .errors import FUSError
+from . import __version__, settings
+from .errors import FUSError, report_error
 from .progress import format_bytes, set_quiet
-from .verification import verify_file, write_manifest
+
+if TYPE_CHECKING:
+    from . import fus
 
 _HISTORY_WRAP_WIDTH = 100
 _FIRMWARE_HELP = "Firmware version to use, for example S721BXXSACZB2/S721BOXMACZB2/S721BXXSACZB2/S721BXXSACZB2"
 _HISTORY_DETAIL_SKIP_TAGS = {
-    "ANDROID_VERSION", "BINARY_ANDROID_VERSION", "BINARY_DISPLAY_NAME", "BINARY_DISPLAY_VERSION",
-    "BINARY_INDEX", "BINARY_LOCAL_CODE", "BINARY_MODEL_DISPLAYNAME", "BINARY_MODEL_NAME",
-    "BINARY_NATURE", "BINARY_OPEN_DATE", "BINARY_OS_NAME", "BINARY_OS_VERSION", "BINARY_SEQUENCE",
-    "BINARY_SW_DISPLAYVERSION", "BINARY_SW_VERSION", "DEVICE_DISPLAY_NAME", "DEVICE_LOCAL_CODE",
-    "DEVICE_MODEL_NAME", "DISPLAY_NAME", "DISPLAY_VERSION", "LOCAL_CODE", "MODEL_NAME", "OS_NAME",
-    "OS_VERSION", "SW_DISPLAYVERSION",
+    "ANDROID_VERSION",
+    "BINARY_ANDROID_VERSION",
+    "BINARY_DISPLAY_NAME",
+    "BINARY_DISPLAY_VERSION",
+    "BINARY_INDEX",
+    "BINARY_LOCAL_CODE",
+    "BINARY_MODEL_DISPLAYNAME",
+    "BINARY_MODEL_NAME",
+    "BINARY_NATURE",
+    "BINARY_OPEN_DATE",
+    "BINARY_OS_NAME",
+    "BINARY_OS_VERSION",
+    "BINARY_SEQUENCE",
+    "BINARY_SW_DISPLAYVERSION",
+    "BINARY_SW_VERSION",
+    "DEVICE_DISPLAY_NAME",
+    "DEVICE_LOCAL_CODE",
+    "DEVICE_MODEL_NAME",
+    "DISPLAY_NAME",
+    "DISPLAY_VERSION",
+    "LOCAL_CODE",
+    "MODEL_NAME",
+    "OS_NAME",
+    "OS_VERSION",
+    "SW_DISPLAYVERSION",
 }
 _SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]?)(?:i?b)?\s*$", re.IGNORECASE)
 
@@ -57,10 +75,14 @@ def _format_history_entry(row: fus.FirmwareHistoryEntry) -> str:
         title.append(row.open_date)
     lines = [", ".join(title)]
     fields = [
-        ("Firmware", row.firmware_version), ("Android", row.android_version),
-        ("Nature", _join_history_values(row.natures)), ("OS", row.os_name),
-        ("Model", row.model_name), ("Name", row.display_name),
-        ("Region", row.local_code), ("Display", row.display_version),
+        ("Firmware", row.firmware_version),
+        ("Android", row.android_version),
+        ("Nature", _join_history_values(row.natures)),
+        ("OS", row.os_name),
+        ("Model", row.model_name),
+        ("Name", row.display_name),
+        ("Region", row.local_code),
+        ("Display", row.display_version),
     ]
     if row.sw_display_version and row.sw_display_version != row.firmware_version:
         fields.append(("SW display", row.sw_display_version))
@@ -139,10 +161,6 @@ def _resolve_args_device(args: argparse.Namespace) -> tuple[str, str]:
     return settings.resolve_device(args.model, args.region)
 
 
-def _print_error(message: str) -> None:
-    print(f"error: {message}", file=sys.stderr)
-
-
 def _write_output_manifests(
     paths: list[Path],
     option: str | None,
@@ -151,6 +169,8 @@ def _write_output_manifests(
 ) -> list[dict[str, object]]:
     if option is None:
         return []
+    from .verification import write_manifest
+
     if option and len(paths) != 1:
         raise ValueError("an explicit --manifest path requires exactly one output file")
     manifests: list[dict[str, object]] = []
@@ -199,7 +219,9 @@ def _build_parser() -> argparse.ArgumentParser:
     content.add_argument("--list-partitions", action="store_true", help="List logical super partitions")
     content.add_argument("--partition", action="append", metavar="NAME", help="Extract a logical partition; repeatable")
     content.add_argument("--unpack-super", action="store_true", help="Extract every logical super partition")
-    download.add_argument("--archive", action="append", metavar="SELECTOR", help="Archive selector; repeatable/globs allowed")
+    download.add_argument(
+        "--archive", action="append", metavar="SELECTOR", help="Archive selector; repeatable/globs allowed"
+    )
     download.add_argument("--keep-sparse", action="store_true", help="Keep Android sparse images sparse")
     _add_network_options(download, threads=True)
     _add_output_mode(download)
@@ -300,6 +322,8 @@ def _history_diff(a: fus.FirmwareHistoryEntry, b: fus.FirmwareHistoryEntry) -> d
 
 
 def _select_history(rows: list[fus.FirmwareHistoryEntry], version: str | None, label: str) -> fus.FirmwareHistoryEntry:
+    from . import fus
+
     if not rows:
         raise FUSError(f"no firmware history returned for {label}")
     if version is None:
@@ -313,6 +337,8 @@ def _select_history(rows: list[fus.FirmwareHistoryEntry], version: str | None, l
 
 
 def _handle_compare(args: argparse.Namespace) -> int:
+    from . import fus
+
     model = args.model.upper()
     region_a, region_b = args.region_a.upper(), args.region_b.upper()
     rows_a = fus.get_firmware_history(model, region_a, timeout_s=args.timeout)
@@ -369,6 +395,8 @@ def _load_batch(path_value: str) -> list[dict[str, Any]]:
 
 
 def _handle_batch(args: argparse.Namespace) -> int:
+    from . import fus
+
     jobs = _load_batch(args.file)
     results: list[dict[str, object]] = []
     for index, job in enumerate(jobs, start=1):
@@ -434,6 +462,8 @@ def _handle_batch(args: argparse.Namespace) -> int:
 
 
 def _handle_download(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    from . import archive, fus
+
     model, region = _resolve_args_device(args)
     common = {
         "model": model,
@@ -474,7 +504,9 @@ def _handle_download(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         if args.json:
             _json_print(payload)
         else:
-            print(f"firmware: {listing.firmware_version}\nfilename: {listing.filename}\nsize: {format_bytes(listing.size)}\n")
+            print(
+                f"firmware: {listing.firmware_version}\nfilename: {listing.filename}\nsize: {format_bytes(listing.size)}\n"
+            )
             print(f"{'Size':>12} {'Compressed':>12}  Name")
             for entry in listing.entries:
                 print(f"{format_bytes(entry.size):>12} {format_bytes(entry.compressed_size):>12}  {entry.name}")
@@ -505,8 +537,12 @@ def _handle_download(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         if args.decrypt:
             parser.error("--decrypt is not needed with --file")
         path = archive.download_firmware_tar_member(
-            outer_selector=args.archive[0], member_name=args.file, out_dir=args.output,
-            keep_sparse=args.keep_sparse, resume=args.resume, **common,
+            outer_selector=args.archive[0],
+            member_name=args.file,
+            out_dir=args.output,
+            keep_sparse=args.keep_sparse,
+            resume=args.resume,
+            **common,
         )
         paths, payload = [path], {"paths": [str(path)]}
     elif args.partition is not None or args.unpack_super:
@@ -515,22 +551,35 @@ def _handle_download(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         if args.decrypt:
             parser.error("--decrypt is not needed with partition extraction")
         extracted = archive.download_firmware_super_partitions(
-            outer_selector=args.archive[0], partitions=tuple(args.partition) if args.partition is not None else None,
-            output=args.output, resume=args.resume, **common,
+            outer_selector=args.archive[0],
+            partitions=tuple(args.partition) if args.partition is not None else None,
+            output=args.output,
+            resume=args.resume,
+            **common,
         )
         paths, payload = list(extracted), {"paths": [str(path) for path in extracted]}
     elif args.archive:
         if args.decrypt:
             parser.error("--decrypt is not needed with --archive")
         extracted = archive.download_firmware_entries(
-            selectors=args.archive, out_dir=args.output, resume=args.resume, **common,
+            selectors=args.archive,
+            out_dir=args.output,
+            resume=args.resume,
+            **common,
         )
         paths, payload = list(extracted), {"paths": [str(path) for path in extracted]}
     else:
         out_dir, out_file = _download_output_args(args.output)
         result = fus.download_firmware(
-            model=model, region=region, firmware_version=args.firmware, out_dir=out_dir, out_file=out_file,
-            resume=args.resume, auto_decrypt=args.decrypt, threads=args.threads, timeout_s=args.timeout,
+            model=model,
+            region=region,
+            firmware_version=args.firmware,
+            out_dir=out_dir,
+            out_file=out_file,
+            resume=args.resume,
+            auto_decrypt=args.decrypt,
+            threads=args.threads,
+            timeout_s=args.timeout,
             rate_limit=args.limit_rate,
         )
         path = result.decrypted_path or result.encrypted_path
@@ -561,19 +610,26 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     set_quiet(bool(getattr(args, "quiet", False) or getattr(args, "json", False)))
+    request_errors: tuple[type[Exception], ...] = ()
     try:
         if args.command == "profile":
             return _handle_profiles(args)
         if args.command == "verify":
+            from .verification import verify_file
+
             result = verify_file(args.file, include_entries=not args.no_entries)
             if args.json:
                 _json_print(result)
             else:
-                print(f"valid: {result['path']}\nformat: {result['format']}\nsize: {format_bytes(result['size'])}\nsha256: {result['sha256']}\nmd5: {result['md5']}")
+                print(
+                    f"valid: {result['path']}\nformat: {result['format']}\nsize: {format_bytes(result['size'])}\nsha256: {result['sha256']}\nmd5: {result['md5']}"
+                )
                 if result.get("entry_count") is not None:
                     print(f"entries: {result['entry_count']}")
             return 0
         if args.command == "manifest":
+            from .verification import write_manifest
+
             metadata = {
                 key: value
                 for key, value in {
@@ -586,6 +642,11 @@ def main(argv: list[str] | None = None) -> int:
             path, payload = write_manifest(args.file, args.output, metadata=metadata)
             _json_print({"path": str(path), "manifest": payload}) if args.json else print(path)
             return 0
+        import requests
+
+        from . import fus
+
+        request_errors = (requests.RequestException,)
         if args.command == "compare":
             return _handle_compare(args)
         if args.command == "batch":
@@ -614,8 +675,15 @@ def main(argv: list[str] | None = None) -> int:
         model, region = _resolve_args_device(args)
         output = Path(args.output).expanduser() if args.output else fus.decrypted_output_path(args.input)
         final_path = fus.decrypt_firmware(
-            version=args.firmware, model=model, region=region, in_file=args.input, out_file=output,
-            enc_ver=args.enc_ver, resume=args.resume, threads=args.threads, timeout_s=args.timeout,
+            version=args.firmware,
+            model=model,
+            region=region,
+            in_file=args.input,
+            out_file=output,
+            enc_ver=args.enc_ver,
+            resume=args.resume,
+            threads=args.threads,
+            timeout_s=args.timeout,
         )
         manifests = _write_output_manifests([final_path], args.manifest)
         payload = {"path": str(final_path), "manifests": manifests}
@@ -628,13 +696,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except ValueError as exc:
         parser.error(str(exc))
-    except FileNotFoundError as exc:
-        _print_error(f"file not found: {exc}")
-        return 2
-    except FUSError as exc:
-        _print_error(str(exc))
-        return 1
-    except requests.RequestException as exc:
-        _print_error(f"request failed: {exc}")
-        return 1
+    except (FileNotFoundError, FUSError) as exc:
+        return report_error(exc)
+    except request_errors as exc:
+        return report_error(exc, request_failed=True)
     return 1
