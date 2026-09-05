@@ -21,8 +21,8 @@ dependencies = [
 [project.scripts]
 asgard = "asgard.cli:main"
 
-[tool.setuptools]
-packages = ["asgard"]
+[tool.setuptools.packages.find]
+include = ["asgard", "asgard.*"]
 
 [tool.ruff]
 line-length = 120
