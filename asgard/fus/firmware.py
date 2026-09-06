@@ -226,6 +226,7 @@ def get_latest_version(model: str, region: str, *, timeout_s: int = 15) -> str:
 
 
 def get_binary_info_for_version(client: FUSClient, model: str, region: str, firmware_version: str) -> BinaryInfo:
+    client.ensure_auth()
     response_text = client.make_request(
         FUSClient.BINARY_INFORM_PATH,
         build_binaryinform_request(model, region, firmware_version=firmware_version, nonce=client.nonce),

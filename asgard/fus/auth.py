@@ -9,7 +9,6 @@ import threading
 from http.cookies import CookieError, SimpleCookie
 
 import requests
-from Cryptodome.Cipher import AES
 
 from ..core.constants import (
     _AES_BLOCK_SIZE,
@@ -28,6 +27,8 @@ def _md5_hexdigest(text: str) -> str:
 def _authenticate_block(in_block: bytes) -> bytes:
     if len(in_block) != _AES_BLOCK_SIZE:
         raise FUSError("nonce block is too short")
+    from Cryptodome.Cipher import AES
+
     return AES.new(_AUTH_AES_KEY, AES.MODE_ECB).encrypt(in_block)
 
 

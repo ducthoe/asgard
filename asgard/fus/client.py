@@ -26,7 +26,6 @@ class FUSClient(FUSAuth):
         self.session = session or requests.Session()
         super().__init__()
         self._refresh_lock = threading.Lock()
-        self.make_request(self.GENERATE_NONCE_PATH)
 
     def _response_is_401(self, response: requests.Response, body: str) -> bool:
         if response.status_code == 401:
@@ -37,25 +36,32 @@ class FUSClient(FUSAuth):
             return False
         return _xml_text(root, "./FUSBody/Results/Status") == "401"
 
+    def _refresh_auth_unlocked(self) -> str:
+        response = self.session.post(
+            f"{_FUS_BASE_URL}{self.GENERATE_NONCE_PATH}",
+            data=b"",
+            headers=self._post_headers(),
+            timeout=self.timeout_s,
+        )
+        body = response.text
+        response.raise_for_status()
+        self._update_identity_state(response)
+        return body
+
+    def ensure_auth(self) -> None:
+        with self._refresh_lock:
+            if not self._has_nonce():
+                self._refresh_auth_unlocked()
+
     def refresh_auth(self) -> str:
         with self._refresh_lock:
-            response = self.session.post(
-                f"{_FUS_BASE_URL}{self.GENERATE_NONCE_PATH}",
-                data=b"",
-                headers=self._post_headers(),
-                timeout=self.timeout_s,
-            )
-            body = response.text
-            response.raise_for_status()
-            self._update_identity_state(response)
-            return body
+            return self._refresh_auth_unlocked()
 
     def make_request(self, path: str, data: bytes | str = b"") -> str:
         if path == self.GENERATE_NONCE_PATH:
             return self.refresh_auth()
         for attempt in range(2):
-            if not self._has_nonce():
-                self.refresh_auth()
+            self.ensure_auth()
             response = self.session.post(
                 f"{_FUS_BASE_URL}{path}",
                 data=data,
