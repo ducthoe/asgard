@@ -19,6 +19,7 @@ Android super images without downloading the complete package first.
 - Extract selected firmware archives or individual files.
 - Decode LZ4-compressed and Android sparse images while extracting them.
 - List and extract logical partitions from Android super images.
+- Merge A/B payload and block OTAs with selectively downloaded base images.
 - Verify local firmware files and generate JSON manifests.
 - Save frequently used model and CSC combinations as profiles.
 - Process multiple download jobs from TOML or JSON files.
@@ -62,6 +63,62 @@ Run `asgard COMMAND --help` for the complete set of options supported by a
 command.
 
 ## Usage
+
+### OTA merging
+
+Supply an OTA ZIP alongside a download to reconstruct its updated images:
+
+```console
+asgard download SM-S938U VZW --ota update.zip --output ./updated
+```
+
+Asgard detects the OTA format and matches its AP/CSC versions against firmware
+history to obtain the complete base version, including the fourth component. If
+history has no unique complete match, supply a four-part `--firmware` explicitly.
+Asgard streams the required images from FUS, and verifies patch source data and
+available target hashes.
+Base images are located from archive contents and `super` metadata, including
+device-specific partition names; archive locations are not inferred from names.
+It merges all OTA partitions and full image files by default. It does not build
+a flashable Odin package or flash the device.
+
+Inspect available targets or select only the outputs you need:
+
+```console
+asgard ota-info update.zip
+asgard download SM-S938U VZW --ota update.zip --ota-list-targets
+asgard download SM-S938U VZW --ota update.zip --ota-partition 'system,vendor' --output ./updated
+asgard download SM-S908B EUX --ota update.zip --ota-file 'vbmeta*' --output ./updated
+```
+
+`--ota-partition` and `--ota-file` accept repeated selectors, comma-separated
+names, and quoted glob patterns. Once either is supplied, only matching targets
+are produced. Full-replacement targets require no base download.
+
+Downloaded images become the merge output in place. A/B operations are ordered
+to preserve their source data. A/B dependency buffers and block-OTA stashes retain
+up to 32 MiB per worker in RAM, spilling additional data to temporary storage.
+Individual patch operations also need working memory. `--ota-work-dir DIR` places
+overflow buffers on another disk or RAM storage. Temporary data is removed automatically.
+Compressed firmware packages and `super.img` are not staged to disk.
+
+Use `--ota-base-dir DIR` for existing base images, or repeat
+`--ota-base-image PARTITION=PATH` to supply individual images. Local raw images
+remain unchanged; LZ4 and Android sparse inputs are decoded automatically.
+Slotted base images prefer `_a` automatically; `--ota-base-image` overrides this.
+`--ota-keep-base` explicitly retains downloaded bases, using separate outputs.
+
+`--resume` checks completed outputs before reusing them. Interrupted merges
+restart from their base; they do not resume from partially patched images.
+`--ota-jobs N` overrides automatic worker selection, and `--ota-force` permits
+replacing existing outputs or overriding the declared base version. Source hash
+checks still apply unless `--ota-no-verify` is explicitly supplied.
+
+Supported payload operations are REPLACE, REPLACE_BZ, REPLACE_XZ, SOURCE_COPY,
+SOURCE_BSDIFF, BROTLI_BSDIFF, ZERO, and DISCARD. Block OTAs support BSDIFF patches,
+move, new, zero, erase, stash, and free commands. Unsupported operations and
+payloads requiring generated verity/FEC data are rejected before base downloads.
+ZIP contents and hashes are checked; OTA signing certificates are not authenticated.
 
 ### Firmware information
 

@@ -1073,6 +1073,7 @@ def download_firmware_super_partitions(
     resume: bool = False,
     timeout_s: int = 30,
     rate_limit: int | None = None,
+    slot_fallback: bool = False,
 ) -> tuple[Path, ...]:
     requested = None if partitions is None else tuple(partitions)
     output_dir = Path(output).expanduser()
@@ -1089,6 +1090,7 @@ def download_firmware_super_partitions(
                 size,
                 requested=requested,
                 output_dir=output_dir,
+                slot_fallback=slot_fallback,
             )
         stage_name = PurePosixPath(name.replace("\\", "/")).name
         source_part = output_dir / f".{stage_name}.{size}.asgard-source.part"
@@ -1115,6 +1117,7 @@ def download_firmware_super_partitions(
                 size,
                 requested=requested,
                 output_dir=output_dir,
+                slot_fallback=slot_fallback,
             )
         source_part.unlink(missing_ok=True)
         return paths

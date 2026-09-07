@@ -120,6 +120,14 @@ def _positive_int(value: str) -> int:
     return result
 
 
+def _ota_base_image(value: str) -> tuple[str, Path]:
+    name, separator, path_value = value.partition("=")
+    name = name.strip().lower()
+    if not separator or not name or not path_value.strip():
+        raise argparse.ArgumentTypeError("use PARTITION=PATH")
+    return name, Path(path_value).expanduser()
+
+
 def _add_device_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("model", help="Device model or a saved profile name")
     parser.add_argument("region", nargs="?", help="CSC/region; omit when using a saved profile")
@@ -224,6 +232,37 @@ def _build_parser() -> argparse.ArgumentParser:
         "--archive", action="append", metavar="SELECTOR", help="Archive selector; repeatable/globs allowed"
     )
     download.add_argument("--keep-sparse", action="store_true", help="Keep Android sparse images sparse")
+    download.add_argument("--ota", metavar="ZIP", help="Merge an OTA ZIP with its base firmware")
+    download.add_argument("--ota-format", choices=("auto", "ab", "block"), default="auto")
+    download.add_argument("--ota-base-dir", metavar="DIR", help="Use local base images before downloading")
+    download.add_argument(
+        "--ota-base-image",
+        action="append",
+        type=_ota_base_image,
+        default=[],
+        metavar="PARTITION=PATH",
+        help="Override one OTA base image; repeatable",
+    )
+    download.add_argument(
+        "--ota-partition",
+        action="append",
+        metavar="SELECTOR",
+        help="Merge matching partition images; repeatable, commas/globs allowed",
+    )
+    download.add_argument(
+        "--ota-file",
+        action="append",
+        metavar="SELECTOR",
+        help="Extract matching full OTA files; repeatable, commas/globs allowed",
+    )
+    download.add_argument("--ota-jobs", type=_positive_int, metavar="N", help="Parallel OTA merge jobs")
+    download.add_argument("--ota-no-verify", action="store_true", help="Skip OTA source and target hashes")
+    download.add_argument("--ota-keep-base", action="store_true", help="Keep downloaded base images")
+    download.add_argument(
+        "--ota-work-dir", metavar="DIR", help="Place overflow OTA source buffers on another drive or RAM storage"
+    )
+    download.add_argument("--ota-force", action="store_true", help="Allow a base mismatch and replace outputs")
+    download.add_argument("--ota-list-targets", action="store_true", help="List selectable targets and sizes")
     _add_network_options(download, threads=True)
     _add_output_mode(download)
     _add_manifest_option(download)
@@ -268,6 +307,12 @@ def _build_parser() -> argparse.ArgumentParser:
     manifest.add_argument("--region")
     manifest.add_argument("--firmware")
     _add_output_mode(manifest)
+
+    ota_info = subparsers.add_parser("ota-info", help="Inspect an A/B or block OTA ZIP")
+    ota_info.add_argument("input")
+    ota_info.add_argument("--format", choices=("auto", "ab", "block"), default="auto")
+    ota_info.add_argument("--no-verify", action="store_true", help="Skip payload metadata verification")
+    _add_output_mode(ota_info)
 
     profile = subparsers.add_parser("profile", help="Manage saved model/CSC profiles")
     profile_sub = profile.add_subparsers(dest="profile_command", required=True)
@@ -466,6 +511,23 @@ def _handle_download(args: argparse.Namespace, parser: argparse.ArgumentParser) 
     from .. import fus
     from ..formats import archive
 
+    if not args.ota and any(
+        (
+            args.ota_format != "auto",
+            args.ota_base_dir,
+            args.ota_base_image,
+            args.ota_partition,
+            args.ota_file,
+            args.ota_jobs,
+            args.ota_no_verify,
+            args.ota_keep_base,
+            args.ota_work_dir,
+            args.ota_force,
+            args.ota_list_targets,
+        )
+    ):
+        parser.error("OTA options require --ota ZIP")
+
     model, region = _resolve_args_device(args)
     common = {
         "model": model,
@@ -474,6 +536,100 @@ def _handle_download(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         "timeout_s": args.timeout,
         "rate_limit": args.limit_rate,
     }
+    if args.ota:
+        incompatible = any(
+            (
+                args.list_entries,
+                args.file,
+                args.list_partitions,
+                args.partition is not None,
+                args.unpack_super,
+                args.archive,
+                args.keep_sparse,
+                args.decrypt,
+            )
+        )
+        if incompatible:
+            parser.error("--ota cannot be combined with archive, partition, sparse, listing, or decrypt options")
+        from ..ota import download_and_merge_ota, inspect_ota, select_ota_targets
+
+        plan = inspect_ota(args.ota, forced_type=args.ota_format, verify=not args.ota_no_verify)
+        selected_partitions, selected_files = select_ota_targets(
+            plan,
+            tuple(args.ota_partition) if args.ota_partition else None,
+            tuple(args.ota_file) if args.ota_file else None,
+        )
+        if args.ota_list_targets:
+            selected_partition_set = set(selected_partitions)
+            selected_file_set = set(selected_files)
+            payload = {
+                **plan.to_dict(),
+                "selected_partitions": list(selected_partitions),
+                "selected_files": list(selected_files),
+            }
+            if args.json:
+                _json_print(payload)
+            else:
+                print(f"type: {plan.metadata.ota_type}")
+                print(
+                    f"base: {args.firmware or (plan.metadata.base_ap + '/' + plan.metadata.base_csc + ' (resolved through firmware history when downloading)')}"
+                )
+                print(f"target: {plan.metadata.post_incremental}")
+                total_size = 0
+                print("partitions:")
+                for partition in plan.partitions:
+                    if partition.name not in selected_partition_set:
+                        continue
+                    source = "base" if partition.source_required else "full"
+                    operations = ", ".join(f"{name.lower()}={count}" for name, count in partition.operations.items())
+                    print(f"  {partition.name}: {format_bytes(partition.size)}, {source}, {operations}")
+                    total_size += partition.size
+                if selected_files:
+                    print("files:")
+                    for file in plan.files:
+                        if file.name in selected_file_set:
+                            print(f"  {file.name}: {format_bytes(file.size)}")
+                            total_size += file.size
+                print(f"selected output size: {format_bytes(total_size)}")
+            return 0
+        if not args.output:
+            parser.error("--output is required with --ota unless --ota-list-targets is used")
+        overrides = dict(args.ota_base_image)
+        if len(overrides) != len(args.ota_base_image):
+            parser.error("--ota-base-image contains a duplicate partition")
+        result = download_and_merge_ota(
+            ota_path=args.ota,
+            model=model,
+            region=region,
+            output=args.output,
+            firmware_version=args.firmware,
+            base_dir=args.ota_base_dir,
+            base_images=overrides,
+            partitions=tuple(args.ota_partition) if args.ota_partition else None,
+            files=tuple(args.ota_file) if args.ota_file else None,
+            work_dir=args.ota_work_dir,
+            jobs=args.ota_jobs or args.threads or 4,
+            forced_type=args.ota_format,
+            verify=not args.ota_no_verify,
+            resume=args.resume,
+            keep_base=args.ota_keep_base,
+            force=args.ota_force,
+            timeout_s=args.timeout,
+            rate_limit=args.limit_rate,
+        )
+        paths = list(result.paths)
+        payload = result.to_dict()
+        manifests = _write_output_manifests(paths, args.manifest)
+        if manifests:
+            payload["manifests"] = manifests
+        if args.json:
+            _json_print(payload)
+        else:
+            for path in paths:
+                print(path)
+            for item in manifests:
+                print(item["path"])
+        return 0
     if args.keep_sparse and not args.file:
         parser.error("--keep-sparse requires --file")
     if args.list_entries:
@@ -643,6 +799,24 @@ def main(argv: list[str] | None = None) -> int:
             }
             path, payload = write_manifest(args.file, args.output, metadata=metadata)
             _json_print({"path": str(path), "manifest": payload}) if args.json else print(path)
+            return 0
+        if args.command == "ota-info":
+            from ..ota import inspect_ota
+
+            plan = inspect_ota(args.input, forced_type=args.format, verify=not args.no_verify)
+            if args.json:
+                _json_print(plan.to_dict())
+            else:
+                print(f"type: {plan.metadata.ota_type}")
+                print(f"base AP: {plan.metadata.base_ap}")
+                print(f"base CSC: {plan.metadata.base_csc}")
+                print(f"target: {plan.metadata.post_incremental}")
+                for partition in plan.partitions:
+                    source = "base" if partition.source_required else "full"
+                    operations = ", ".join(f"{name.lower()}={count}" for name, count in partition.operations.items())
+                    print(f"{partition.name}: {format_bytes(partition.size)}, {source}, {operations}")
+                for file in plan.files:
+                    print(f"{file.name}: {format_bytes(file.size)}, full file")
             return 0
         import requests
 

@@ -569,6 +569,8 @@ def list_super_partitions(
 def _select_lp_partitions(
     metadata: _LpMetadata,
     requested: tuple[str, ...] | None,
+    *,
+    slot_fallback: bool = False,
 ) -> tuple[_LpPartition, ...]:
     if requested is None:
         return metadata.partitions
@@ -577,6 +579,26 @@ def _select_lp_partitions(
         raise ValueError("at least one non-empty partition name is required")
     requested_set = set(requested_names)
     selected = tuple(partition for partition in metadata.partitions if partition.name in requested_set)
+    if slot_fallback:
+        found_names = {partition.name for partition in selected}
+        aliases = []
+        for name in requested_names:
+            if name in found_names:
+                continue
+            for suffix in ("_a", "_b"):
+                partition = next(
+                    (
+                        item
+                        for item in metadata.partitions
+                        if item.name == name + suffix and _lp_partition_size(metadata, item) > 0
+                    ),
+                    None,
+                )
+                if partition is not None:
+                    aliases.append(_LpPartition(name, partition.first_extent_index, partition.num_extents))
+                    found_names.add(name)
+                    break
+        selected += tuple(aliases)
     found = {partition.name for partition in selected}
     missing = tuple(dict.fromkeys(name for name in requested_names if name not in found))
     if missing:
@@ -638,6 +660,7 @@ def extract_super_partitions(
     *,
     requested: tuple[str, ...] | None,
     output_dir: Path,
+    slot_fallback: bool = False,
 ) -> tuple[Path, ...]:
     with _open_super_image_reader(
         source,
@@ -645,7 +668,7 @@ def extract_super_partitions(
         member_size=member_size,
     ) as reader:
         metadata = _read_lp_metadata(reader)
-        selected = _select_lp_partitions(metadata, requested)
+        selected = _select_lp_partitions(metadata, requested, slot_fallback=slot_fallback)
         spans, sizes = _build_super_copy_plan(metadata, selected, reader)
         progress_start = reader.tell()
         progress_end = spans[-1].source_offset + spans[-1].size if spans else progress_start
