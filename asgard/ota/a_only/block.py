@@ -17,7 +17,6 @@ from pathlib import Path
 
 from ...cli.progress import print_info
 from ...core.errors import FUSError
-from ..buffers import SourceBuffers
 from ..inplace import prepare_image, zero_range
 from ..models import OtaFile, OtaPartition
 from ..patch import apply_bsdiff
@@ -337,7 +336,7 @@ def _source_spec(tokens: list[str], digest: str) -> tuple[_Ranges, _SourceSpec]:
     return target, _SourceSpec(digest.lower(), blocks, ranges, locations, tuple(stashes))
 
 
-def _load_source(output, source: _SourceSpec, stashes: SourceBuffers, *, verify: bool) -> bytes:
+def _load_source(output, source: _SourceSpec, stashes: dict[str, bytes], *, verify: bool) -> bytes:
     result = bytearray(source.blocks * _BLOCK_SIZE)
     if source.ranges.blocks:
         raw = _read_ranges(output, source.ranges)
@@ -447,7 +446,6 @@ def _apply_transfer(
     resume: bool,
     force: bool,
     consume_source: bool = False,
-    work_dir: Path | None = None,
 ) -> tuple[Path, bool]:
     destination = output_dir / f"{transfer.name}.img"
     with zipfile.ZipFile(ota_path) as archive:
@@ -476,7 +474,7 @@ def _apply_transfer(
                 patch_fd, patch_offset = _stored_entry_offset(ota_path, archive.getinfo(patch_entry))
             else:
                 patch_offset = 0
-            stashes = stack.enter_context(SourceBuffers(work_dir))
+            stashes: dict[str, bytes] = {}
             with part_path.open("r+b") as output:
                 output.truncate(max(output.seek(0, os.SEEK_END), expected_size))
                 for raw_command in transfer.commands:
@@ -497,7 +495,7 @@ def _apply_transfer(
                         stashes[tokens[0]] = raw
                         del raw
                     elif command == "free":
-                        stashes.discard(tokens[0])
+                        stashes.pop(tokens[0], None)
                     elif command == "move":
                         target, source = _source_spec(tokens[1:], tokens[0])
                         result = _load_source(output, source, stashes, verify=verify)
@@ -536,6 +534,10 @@ def _apply_transfer(
         if patch_fd >= 0:
             os.close(patch_fd)
         part_path.unlink(missing_ok=True)
+        if isinstance(exc, MemoryError):
+            raise FUSError(
+                "not enough RAM for OTA source buffers; select fewer partitions or reduce --ota-jobs"
+            ) from exc
         if isinstance(exc, (OSError, EOFError, zipfile.BadZipFile)):
             raise FUSError(f"could not merge OTA partition {transfer.name}: {exc}") from exc
         raise
@@ -650,7 +652,6 @@ def apply_block_ota(
     resume: bool = False,
     force: bool = False,
     consume_base: frozenset[str] = frozenset(),
-    work_dir: Path | None = None,
 ) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
     ota_path = Path(ota_path_value).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -700,7 +701,6 @@ def apply_block_ota(
                             resume=resume,
                             force=force,
                             consume_source=transfer.name in consume_base,
-                            work_dir=work_dir,
                         ),
                     )
                 )

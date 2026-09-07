@@ -146,7 +146,6 @@ def merge_ota(
     resume: bool = False,
     force: bool = False,
     consume_base: frozenset[str] = frozenset(),
-    work_dir: Path | None = None,
 ) -> OtaMergeResult:
     plan = inspect_ota(ota_path, forced_type=forced_type, verify=verify)
     selected, selected_files = select_ota_targets(plan, partitions, files)
@@ -176,7 +175,6 @@ def merge_ota(
             resume=resume,
             force=force,
             consume_base=consume_base,
-            work_dir=work_dir,
         )
     else:
         paths, skipped = apply_block_ota(
@@ -190,7 +188,6 @@ def merge_ota(
             resume=resume,
             force=force,
             consume_base=consume_base,
-            work_dir=work_dir,
         )
     outputs = {path.name: path for path in prior + paths}
     paths = tuple(outputs[name] for name in expected_names)
@@ -210,7 +207,6 @@ def download_and_merge_ota(
     base_images: dict[str, Path] | None = None,
     partitions: tuple[str, ...] | None = None,
     files: tuple[str, ...] | None = None,
-    work_dir: str | Path | None = None,
     jobs: int = 4,
     forced_type: str = "auto",
     verify: bool = True,
@@ -235,8 +231,6 @@ def download_and_merge_ota(
     completed = completed_outputs(plan.metadata.path, output_dir, verify=verify, names=expected_names) if resume else {}
     source_members = {name: member for name, member in source_members.items() if output_names[name] not in completed}
     _check_existing_outputs(output_dir, expected_names, completed, force=force)
-    work_root = Path(work_dir).expanduser().resolve() if work_dir else output_dir
-    work_root.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".asgard-ota-", dir=output_dir))
     override_paths = {name: Path(path).expanduser().resolve() for name, path in (base_images or {}).items()}
     local_dir = Path(base_dir).expanduser().resolve() if base_dir is not None else None
@@ -279,7 +273,6 @@ def download_and_merge_ota(
             consume_base=frozenset(name for name, path in sources.items() if path.is_relative_to(staging))
             if not keep_base
             else frozenset(),
-            work_dir=work_root,
         )
     finally:
         if not keep_base:

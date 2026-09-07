@@ -12,13 +12,11 @@ import struct
 import zipfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
 from ...cli.progress import print_info
 from ...core.errors import FUSError
-from ..buffers import SourceBuffers
 from ..inplace import prepare_image, write_all, zero_range
 from ..models import OtaPartition
 from ..patch import apply_bsdiff, normalize_source_signature
@@ -454,7 +452,6 @@ def _apply_partition(
     resume: bool,
     force: bool,
     consume_source: bool = False,
-    work_dir: Path | None = None,
 ) -> tuple[Path, bool]:
     _validate_partition(partition, payload.manifest.block_size)
     destination = output_dir / f"{partition.name}.img"
@@ -497,10 +494,9 @@ def _apply_partition(
         if in_place:
             prepare_image(source_path, part_path, consume=True)
             source_path = part_path
-        with ExitStack() as stack:
-            output = stack.enter_context(part_path.open("r+b" if in_place else "x+b", buffering=0))
+        with part_path.open("r+b" if in_place else "x+b", buffering=0) as output:
             output.truncate(max(partition.new.size, partition.old.size if in_place else 0))
-            cached = stack.enter_context(SourceBuffers(work_dir))
+            cached: dict[int, bytes] = {}
             for save, index in order:
                 operation = partition.operations[index]
                 if save:
@@ -514,7 +510,7 @@ def _apply_partition(
                 if operation.source_extents:
                     if source_path is None:
                         raise FUSError(f"base image is required for {partition.name}")
-                    saved = cached.pop(index)
+                    saved = cached.pop(index, None)
                     if saved is not None:
                         source = saved
                     else:
@@ -584,6 +580,10 @@ def _apply_partition(
         return destination, False
     except BaseException as exc:
         part_path.unlink(missing_ok=True)
+        if isinstance(exc, MemoryError):
+            raise FUSError(
+                "not enough RAM for OTA source buffers; select fewer partitions or reduce --ota-jobs"
+            ) from exc
         if isinstance(exc, (OSError, EOFError, lzma.LZMAError)):
             raise FUSError(f"could not merge OTA partition {partition.name}: {exc}") from exc
         raise
@@ -600,7 +600,6 @@ def apply_payload(
     resume: bool = False,
     force: bool = False,
     consume_base: frozenset[str] = frozenset(),
-    work_dir: Path | None = None,
 ) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     with open_payload(ota_path, verify=verify) as payload:
@@ -625,7 +624,6 @@ def apply_payload(
                     resume=resume,
                     force=force,
                     consume_source=partition.name in consume_base,
-                    work_dir=work_dir,
                 ): partition.name
                 for partition in selected
             }

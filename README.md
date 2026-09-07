@@ -96,10 +96,10 @@ names, and quoted glob patterns. Once either is supplied, only matching targets
 are produced. Full-replacement targets require no base download.
 
 Downloaded images become the merge output in place. A/B operations are ordered
-to preserve their source data. A/B dependency buffers and block-OTA stashes retain
-up to 32 MiB per worker in RAM, spilling additional data to temporary storage.
-Individual patch operations also need working memory. `--ota-work-dir DIR` places
-overflow buffers on another disk or RAM storage. Temporary data is removed automatically.
+to preserve their source data. A/B dependency buffers and block-OTA stashes stay
+entirely in RAM, without application-managed spill files. Individual patch
+operations also need working memory; reduce `--ota-jobs` or select fewer partitions
+if RAM is limited. The operating system may still swap memory according to its settings.
 Compressed firmware packages and `super.img` are not staged to disk.
 
 Use `--ota-base-dir DIR` for existing base images, or repeat

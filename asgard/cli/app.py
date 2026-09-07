@@ -258,9 +258,6 @@ def _build_parser() -> argparse.ArgumentParser:
     download.add_argument("--ota-jobs", type=_positive_int, metavar="N", help="Parallel OTA merge jobs")
     download.add_argument("--ota-no-verify", action="store_true", help="Skip OTA source and target hashes")
     download.add_argument("--ota-keep-base", action="store_true", help="Keep downloaded base images")
-    download.add_argument(
-        "--ota-work-dir", metavar="DIR", help="Place overflow OTA source buffers on another drive or RAM storage"
-    )
     download.add_argument("--ota-force", action="store_true", help="Allow a base mismatch and replace outputs")
     download.add_argument("--ota-list-targets", action="store_true", help="List selectable targets and sizes")
     _add_network_options(download, threads=True)
@@ -521,7 +518,6 @@ def _handle_download(args: argparse.Namespace, parser: argparse.ArgumentParser) 
             args.ota_jobs,
             args.ota_no_verify,
             args.ota_keep_base,
-            args.ota_work_dir,
             args.ota_force,
             args.ota_list_targets,
         )
@@ -607,7 +603,6 @@ def _handle_download(args: argparse.Namespace, parser: argparse.ArgumentParser) 
             base_images=overrides,
             partitions=tuple(args.ota_partition) if args.ota_partition else None,
             files=tuple(args.ota_file) if args.ota_file else None,
-            work_dir=args.ota_work_dir,
             jobs=args.ota_jobs or args.threads or 4,
             forced_type=args.ota_format,
             verify=not args.ota_no_verify,
