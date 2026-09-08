@@ -571,6 +571,7 @@ def _select_lp_partitions(
     requested: tuple[str, ...] | None,
     *,
     slot_fallback: bool = False,
+    allow_missing: bool = False,
 ) -> tuple[_LpPartition, ...]:
     if requested is None:
         return metadata.partitions
@@ -578,7 +579,11 @@ def _select_lp_partitions(
     if not requested_names or any(not name for name in requested_names):
         raise ValueError("at least one non-empty partition name is required")
     requested_set = set(requested_names)
-    selected = tuple(partition for partition in metadata.partitions if partition.name in requested_set)
+    selected = tuple(
+        partition
+        for partition in metadata.partitions
+        if partition.name in requested_set and (not allow_missing or _lp_partition_size(metadata, partition) > 0)
+    )
     if slot_fallback:
         found_names = {partition.name for partition in selected}
         aliases = []
@@ -601,7 +606,7 @@ def _select_lp_partitions(
         selected += tuple(aliases)
     found = {partition.name for partition in selected}
     missing = tuple(dict.fromkeys(name for name in requested_names if name not in found))
-    if missing:
+    if missing and not allow_missing:
         available = ", ".join(partition.name for partition in metadata.partitions)
         raise FUSError(
             f"super partition not found: {', '.join(missing)}"
@@ -661,6 +666,7 @@ def extract_super_partitions(
     requested: tuple[str, ...] | None,
     output_dir: Path,
     slot_fallback: bool = False,
+    allow_missing: bool = False,
 ) -> tuple[Path, ...]:
     with _open_super_image_reader(
         source,
@@ -668,7 +674,9 @@ def extract_super_partitions(
         member_size=member_size,
     ) as reader:
         metadata = _read_lp_metadata(reader)
-        selected = _select_lp_partitions(metadata, requested, slot_fallback=slot_fallback)
+        selected = _select_lp_partitions(metadata, requested, slot_fallback=slot_fallback, allow_missing=allow_missing)
+        if not selected:
+            return ()
         spans, sizes = _build_super_copy_plan(metadata, selected, reader)
         progress_start = reader.tell()
         progress_end = spans[-1].source_offset + spans[-1].size if spans else progress_start

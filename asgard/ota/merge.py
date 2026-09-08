@@ -228,7 +228,11 @@ def download_and_merge_ota(
         raise FUSError(f"OTA output must be a directory: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
     expected_names = _target_names(plan, selected, selected_files)
+    if resume:
+        print_info("Checking completed OTA outputs...")
     completed = completed_outputs(plan.metadata.path, output_dir, verify=verify, names=expected_names) if resume else {}
+    if completed:
+        print_info(f"Resume: verified {len(completed)} completed outputs; only unfinished targets need base images")
     source_members = {name: member for name, member in source_members.items() if output_names[name] not in completed}
     _check_existing_outputs(output_dir, expected_names, completed, force=force)
     staging = Path(tempfile.mkdtemp(prefix=".asgard-ota-", dir=output_dir))
@@ -258,6 +262,7 @@ def download_and_merge_ota(
                 timeout_s=timeout_s,
                 rate_limit=rate_limit,
                 preferred_archives=(plan.metadata.source_csc_name, plan.metadata.source_ap_name),
+                source_cache=output_dir / ".asgard-ota-sources.json",
             )
         result = merge_ota(
             plan.metadata.path,

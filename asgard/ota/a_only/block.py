@@ -165,10 +165,10 @@ def _patch_specs(archive: zipfile.ZipFile) -> tuple[_PatchSpec, ...]:
     for match in _PATCH_CALL_RE.finditer(script):
         descriptors = _PATCH_DESCRIPTOR_RE.findall(match.group(1))
         names = _PARTITION_NAME_RE.findall(match.group(1))
-        if len(descriptors) < 2 or not names:
+        if len(descriptors) != 2 or not names:
             continue
-        source_size, source_digest = descriptors[0]
-        target_size, target_digest = descriptors[1]
+        target_size, target_digest = descriptors[0]
+        source_size, source_digest = descriptors[1]
         filename = Path(match.group(2)).name.removesuffix(".p")
         name, member = Path(filename).stem, filename + ".lz4"
         specs.append(

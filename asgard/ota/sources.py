@@ -3,17 +3,58 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import tarfile
+import time
+import zipfile
+from pathlib import Path, PurePosixPath
 
+from ..cli.progress import print_info, render_progress
+from ..core.constants import _ARCHIVE_COPY_CHUNK_SIZE, _PROGRESS_REFRESH_S
 from ..core.errors import FUSError
-from ..formats.images import copy_image_stream, copy_lz4_stream, extract_super_partitions, list_super_partitions
+from ..formats.images import copy_image_stream, copy_lz4_stream, extract_super_partitions
+from .source_cache import load_locations, save_locations, source_identity
 
 
-def _super_matches(available, requested) -> tuple[str, ...]:
-    names = {item.name for item in available if item.size > 0}
-    return tuple(
-        name for name in requested if any(candidate in names for candidate in (name, name + "_a", name + "_b"))
-    )
+class _ArchiveScanReader:
+    def __init__(self, source, name: str, size: int):
+        self.source = source
+        self.label = f"Scanning {name}"
+        self.size = size
+        self.enabled = False
+        self.resume()
+
+    def tell(self) -> int:
+        return self.source.tell()
+
+    def read(self, size: int = -1) -> bytes:
+        data = self.source.read(size)
+        self.update()
+        return data
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        position = self.source.seek(offset, whence)
+        self.update()
+        return position
+
+    def update(self, *, complete: bool = False) -> None:
+        now = time.monotonic()
+        if self.enabled and (complete or now - self.last_render >= _PROGRESS_REFRESH_S):
+            done = min(self.size, self.tell())
+            render_progress(
+                self.label, done, self.size, self.started_at, speed_done=max(0, done - self.initial), complete=complete
+            )
+            self.last_render = now
+
+    def pause(self) -> None:
+        self.update(complete=True)
+        self.enabled = False
+
+    def resume(self) -> None:
+        self.started_at = time.monotonic()
+        self.initial = self.tell()
+        self.last_render = 0.0
+        self.enabled = True
+        self.update()
 
 
 def _candidate_paths(base_dir: Path, name: str, member: str) -> tuple[Path, ...]:
@@ -97,25 +138,22 @@ def _local_sources(
                 raise FUSError(f"multiple local base images for {name}; select one with --ota-base-image")
             if matches:
                 sources[name] = _materialize_image(matches[0], name, staging, resume=resume)
-        missing_dynamic = tuple(name for name in source_members if name not in sources)
-        if missing_dynamic:
+        missing = tuple(name for name in source_members if name not in sources)
+        if missing:
             super_image = next(
                 (base_dir / name for name in ("super.img", "super.img.lz4") if (base_dir / name).is_file()),
                 None,
             )
             if super_image is not None:
                 with super_image.open("rb") as stream:
-                    available = list_super_partitions(stream, super_image.name, super_image.stat().st_size)
-                missing_dynamic = _super_matches(available, missing_dynamic)
-            if super_image is not None and missing_dynamic:
-                with super_image.open("rb") as stream:
                     extracted = extract_super_partitions(
                         stream,
                         super_image.name,
                         super_image.stat().st_size,
-                        requested=missing_dynamic,
+                        requested=missing,
                         output_dir=staging,
                         slot_fallback=True,
+                        allow_missing=True,
                     )
                 sources.update({path.stem: path for path in extracted})
     return sources
@@ -133,66 +171,120 @@ def _download_sources(
     timeout_s: int,
     rate_limit: int | None,
     preferred_archives: tuple[str, ...] = (),
+    source_cache: Path | None = None,
 ) -> dict[str, Path]:
     from ..formats import archive
 
     common = dict(
         model=model, region=region, firmware_version=firmware_version, timeout_s=timeout_s, rate_limit=rate_limit
     )
-    listing = archive.list_firmware_entries(**common)
-    entries = [entry.name for entry in listing.entries if entry.name.lower().endswith((".tar", ".tar.md5"))]
-    entries.sort(
-        key=lambda name: (
-            preferred_archives.index(name) if name in preferred_archives else len(preferred_archives),
-            name,
-        )
-    )
-    found = set(sources)
-    direct = {}
-    supers = []
-    for entry in entries:
-        if all(name in found for name in source_members):
-            break
-        members = archive.iter_firmware_tar_entries(outer_selector=entry, **common)
-        try:
-            for member in members:
-                pending = tuple(name for name in source_members if name not in found)
-                if not pending:
-                    break
-                if Path(member.name).name.lower() in {"super.img", "super.img.lz4"}:
-                    available = tuple(archive.iter_firmware_super_partitions(outer_selector=entry, **common))
-                    selected = _super_matches(available, pending)
-                    if selected:
-                        supers.append((entry, selected))
-                        found.update(selected)
-                    if all(name in found for name in source_members):
-                        break
-                    continue
-                matches = [
-                    name
-                    for name in pending
-                    if Path(member.name).name
-                    in {path.name for path in _candidate_paths(Path("."), name, source_members[name])}
-                ]
-                if len(matches) > 1:
-                    raise FUSError(f"ambiguous OTA source member: {member.name}")
-                if matches:
-                    direct[matches[0]] = (entry, member.name)
-                    found.add(matches[0])
-                    if all(name in found for name in source_members):
-                        break
-        finally:
-            members.close()
-    missing = sorted(set(source_members) - found)
+    pending = {
+        name: {path.name for path in _candidate_paths(Path("."), name, member)}
+        for name, member in source_members.items()
+        if name not in sources
+    }
+    if not pending:
+        return sources
+    print_info("Connecting to FUS for OTA base images...")
+    with archive._open_remote_firmware_archive(**common) as remote:
+        entries = [
+            entry
+            for entry in remote.archive.infolist()
+            if not entry.is_dir() and entry.filename.lower().endswith((".tar", ".tar.md5"))
+        ]
+        identity = source_identity(model, region, firmware_version, entries)
+        entry_names = {entry.filename for entry in entries}
+        locations = {
+            name: entry for name, entry in load_locations(source_cache, identity).items() if entry in entry_names
+        }
+        while entries and pending:
+            known_entries = {locations[name] for name in pending if name in locations}
+            fully_located = all(name in locations for name in pending)
+            entry = min(
+                entries,
+                key=lambda item: (
+                    fully_located and item.filename not in known_entries,
+                    item.file_size,
+                    preferred_archives.index(item.filename)
+                    if item.filename in preferred_archives
+                    else len(preferred_archives),
+                    item.filename,
+                ),
+            )
+            entries.remove(entry)
+            with remote.archive.open(entry) as stream:
+                scan = _ArchiveScanReader(stream, entry.filename, entry.file_size)
+                mode = "r:" if entry.compress_type == zipfile.ZIP_STORED else "r|"
+                try:
+                    with tarfile.open(fileobj=scan, mode=mode, bufsize=_ARCHIVE_COPY_CHUNK_SIZE) as members:
+                        for member in members:
+                            if not member.isfile():
+                                continue
+                            basename = PurePosixPath(member.name.replace("\\", "/")).name
+                            is_super = basename.lower() in {"super.img", "super.img.lz4"}
+                            matches = [name for name, candidates in pending.items() if basename in candidates]
+                            if len(matches) > 1:
+                                raise FUSError(f"ambiguous OTA source member: {member.name}")
+                            if not is_super and not matches:
+                                continue
+                            scan.pause()
+                            source = members.extractfile(member)
+                            if source is None:
+                                raise FUSError(f"could not open OTA base member: {member.name}")
+                            with source:
+                                if is_super:
+                                    print_info("Reading super metadata and streaming matching OTA bases...")
+                                    extracted = extract_super_partitions(
+                                        source,
+                                        member.name,
+                                        member.size,
+                                        requested=tuple(pending),
+                                        output_dir=staging,
+                                        slot_fallback=True,
+                                        allow_missing=True,
+                                    )
+                                    for path in extracted:
+                                        sources[path.stem] = path
+                                        pending.pop(path.stem)
+                                        locations[path.stem] = entry.filename
+                                else:
+                                    name = matches[0]
+                                    suffix = Path(basename.removesuffix(".lz4")).suffix
+                                    destination = staging / f"{name}{suffix}"
+                                    part_path = destination.with_name(f"{destination.name}.part")
+                                    if destination.exists() or part_path.exists():
+                                        raise FUSError(f"OTA base staging output already exists: {destination}")
+                                    try:
+                                        archive._write_firmware_tar_member(
+                                            source,
+                                            part_path,
+                                            requested_name=basename,
+                                            output_name=destination.name,
+                                            member_size=member.size,
+                                            keep_sparse=False,
+                                        )
+                                        part_path.replace(destination)
+                                    except BaseException:
+                                        part_path.unlink(missing_ok=True)
+                                        raise
+                                    sources[name] = destination
+                                    pending.pop(name)
+                                    locations[name] = entry.filename
+                            save_locations(source_cache, identity, locations)
+                            if not pending or all(
+                                name in locations and locations[name] != entry.filename for name in pending
+                            ):
+                                break
+                            scan.resume()
+                except tarfile.TarError as exc:
+                    raise FUSError(f"could not read OTA base archive {entry.filename}: {exc}") from exc
+                finally:
+                    scan.pause()
+            for name in pending:
+                if locations.get(name) == entry.filename:
+                    locations.pop(name)
+            save_locations(source_cache, identity, locations)
+    missing = sorted(pending)
     if missing:
         raise FUSError(f"base firmware contains no images for: {', '.join(missing)}")
-    for entry, selected in supers:
-        extracted = archive.download_firmware_super_partitions(
-            outer_selector=entry, partitions=selected, output=staging, slot_fallback=True, **common
-        )
-        sources.update({path.stem: path for path in extracted})
-    for name, (entry, member) in direct.items():
-        sources[name] = archive.download_firmware_tar_member(
-            outer_selector=entry, member_name=member, out_dir=staging, **common
-        )
     return sources
