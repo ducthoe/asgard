@@ -13,6 +13,7 @@ from typing import Callable
 import requests
 from Cryptodome.Cipher import AES
 
+from ..cli.pipeline import PipelineProgress
 from ..cli.progress import format_bytes as _format_bytes
 from ..cli.progress import print_info as _print_info
 from ..cli.progress import render_progress as _render_progress
@@ -99,6 +100,7 @@ def _download_ranges_parallel(
     recover_download: Callable[[], None] | None = None,
     rate_limiter: BandwidthLimiter | None = None,
     workers: int | None = None,
+    network_progress: Callable[[int], None] | None = None,
 ) -> None:
     if workers is not None and workers <= 0:
         raise ValueError("threads must be positive")
@@ -156,6 +158,8 @@ def _download_ranges_parallel(
                             return
                         if not chunk:
                             continue
+                        if network_progress is not None:
+                            network_progress(len(chunk))
                         if rate_limiter is not None:
                             rate_limiter.consume(len(chunk))
                         if len(chunk) > expected_response_size - response_received:
@@ -255,7 +259,7 @@ def _download_ranges_parallel(
                 err = errors[0] if errors else None
                 snapshot = [dict(item) for item in ranges]
             _render_progress(
-                "Downloading",
+                "Decrypting" if decrypt_key is not None else "Downloading",
                 done,
                 total_size,
                 started_at,
@@ -284,7 +288,7 @@ def _download_ranges_parallel(
         done = _resume_done_bytes(ranges)
         err = errors[0] if errors else None
     _render_progress(
-        "Downloading",
+        "Decrypting" if decrypt_key is not None else "Downloading",
         done,
         total_size,
         started_at,
@@ -379,17 +383,19 @@ def download_firmware(
 
     decrypt_key = _decryption_key_from_info(info, model_u, region_u)
     if done_before < info.size:
-        _download_ranges_parallel(
-            client=client,
-            remote_path=remote_path,
-            out_path=temp_path,
-            total_size=info.size,
-            ranges=ranges,
-            decrypt_key=decrypt_key,
-            recover_download=recover_download,
-            rate_limiter=limiter,
-            workers=worker_count if threads is not None else None,
-        )
+        with PipelineProgress() as progress:
+            _download_ranges_parallel(
+                client=client,
+                remote_path=remote_path,
+                out_path=temp_path,
+                total_size=info.size,
+                ranges=ranges,
+                decrypt_key=decrypt_key,
+                recover_download=recover_download,
+                rate_limiter=limiter,
+                workers=worker_count if threads is not None else None,
+                network_progress=progress.add_download,
+            )
     meta_path.unlink(missing_ok=True)
     final_stream_path = _finalize_stream_decrypted_file(temp_path, final_path)
     return DownloadResult(encrypted_path, final_stream_path, firmware, info.filename, info.size)

@@ -83,6 +83,7 @@ def _read_download_range(
     end: int,
     total_size: int,
     recover_download: Callable[[], None] | None = None,
+    network_progress: Callable[[int], None] | None = None,
 ) -> bytes:
     expected_size = end - start + 1
     for attempt in range(1, _DOWNLOAD_RETRIES + 2):
@@ -95,6 +96,8 @@ def _read_download_range(
             for chunk in response.iter_content(chunk_size=_RANGE_CHUNK_SIZE):
                 if not chunk:
                     continue
+                if network_progress is not None:
+                    network_progress(len(chunk))
                 received += len(chunk)
                 if received > expected_size:
                     raise RetryableDownloadError(
@@ -133,6 +136,7 @@ class _FUSDecryptingReader(io.RawIOBase):
         recover_download: Callable[[], None] | None = None,
         stream_chunk_size: int = _RANGE_CHUNK_SIZE,
         rate_limiter: BandwidthLimiter | None = None,
+        network_progress: Callable[[int], None] | None = None,
     ):
         super().__init__()
         self._response: requests.Response | None = None
@@ -148,6 +152,7 @@ class _FUSDecryptingReader(io.RawIOBase):
         self._recover_download = recover_download
         self._stream_chunk_size = stream_chunk_size
         self._rate_limiter = rate_limiter
+        self._network_progress = network_progress
         self._position = 0
         self._response_iter: Iterator[bytes] | None = None
         self._cipher: AES | None = None
@@ -167,6 +172,7 @@ class _FUSDecryptingReader(io.RawIOBase):
             end=self._encrypted_size - 1,
             total_size=self._encrypted_size,
             recover_download=self._recover_download,
+            network_progress=network_progress,
         )
         decrypted_tail = AES.new(self._key, AES.MODE_ECB).decrypt(encrypted_tail)
         unpadded_last_block = _pkcs7_unpad(decrypted_tail[-_AES_BLOCK_SIZE:])
@@ -316,6 +322,8 @@ class _FUSDecryptingReader(io.RawIOBase):
                 chunk = next(self._response_iter)
                 if not chunk:
                     continue
+                if self._network_progress is not None:
+                    self._network_progress(len(chunk))
                 if self._rate_limiter is not None:
                     self._rate_limiter.consume(len(chunk))
                 encrypted = self._cipher_buffer + chunk if self._cipher_buffer else chunk

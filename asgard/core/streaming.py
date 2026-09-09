@@ -9,6 +9,7 @@ import queue
 import threading
 import time
 from contextlib import contextmanager
+from contextvars import copy_context
 from typing import Iterator
 
 from ..cli.progress import render_progress
@@ -27,7 +28,9 @@ class _PrefetchReader(io.RawIOBase):
         self._buffer = b""
         self._buffer_offset = 0
         self._eof = False
-        self._thread = threading.Thread(target=self._produce, name="asgard-prefetch", daemon=True)
+        self._thread = threading.Thread(
+            target=copy_context().run, args=(self._produce,), name="asgard-prefetch", daemon=True
+        )
         self._thread.start()
 
     def readable(self) -> bool:

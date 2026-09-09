@@ -7,6 +7,8 @@ import os
 import sys
 import time
 
+from .pipeline import current_pipeline, display_message
+
 _QUIET = False
 
 
@@ -17,6 +19,8 @@ def set_quiet(quiet: bool) -> None:
 
 def print_info(message: str) -> None:
     if _QUIET:
+        return
+    if display_message(message):
         return
     print(message, flush=True)
 
@@ -46,6 +50,10 @@ def render_progress(
     complete: bool = False,
 ) -> None:
     if _QUIET:
+        return
+    pipeline = current_pipeline()
+    if pipeline is not None:
+        pipeline.update_decode(label, done, total, started_at, speed_done=speed_done, complete=complete)
         return
     elapsed = max(time.monotonic() - started_at, 0.001)
     speed = (done if speed_done is None else speed_done) / elapsed

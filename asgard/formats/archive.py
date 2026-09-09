@@ -19,6 +19,7 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, Iterator, TypeVar
 
 from .. import fus as _fus
+from ..cli.pipeline import PipelineProgress
 from ..cli.progress import format_bytes, print_info
 from ..core.constants import (
     _ARCHIVE_COPY_CHUNK_SIZE,
@@ -121,6 +122,28 @@ def _open_remote_firmware_archive(
     timeout_s: int = 30,
     rate_limit: int | None = None,
 ) -> Iterator[_RemoteFirmwareArchive]:
+    with PipelineProgress() as progress:
+        with _remote_firmware_archive(
+            model=model,
+            region=region,
+            firmware_version=firmware_version,
+            timeout_s=timeout_s,
+            rate_limit=rate_limit,
+            network_progress=progress.add_download,
+        ) as remote:
+            yield remote
+
+
+@contextmanager
+def _remote_firmware_archive(
+    *,
+    model: str,
+    region: str,
+    firmware_version: str | None,
+    timeout_s: int,
+    rate_limit: int | None,
+    network_progress: Callable[[int], None],
+) -> Iterator[_RemoteFirmwareArchive]:
     model_u, region_u = _fus._device_codes(model, region)
     client = _fus.FUSClient(timeout_s=timeout_s)
     try:
@@ -144,6 +167,7 @@ def _open_remote_firmware_archive(
             recover_download=recover_download,
             stream_chunk_size=_ARCHIVE_COPY_CHUNK_SIZE,
             rate_limiter=_fus.BandwidthLimiter(rate_limit),
+            network_progress=network_progress,
         )
     except Exception:
         client.session.close()

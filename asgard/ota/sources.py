@@ -197,6 +197,11 @@ def _download_sources(
         locations = {
             name: entry for name, entry in load_locations(source_cache, identity).items() if entry in entry_names
         }
+        declared_entries = {
+            entry.filename
+            for entry in entries
+            if PurePosixPath(entry.filename.replace("\\", "/")).name in preferred_archives
+        }
         while entries and pending:
             known_entries = {locations[name] for name in pending if name in locations}
             fully_located = all(name in locations for name in pending)
@@ -204,6 +209,7 @@ def _download_sources(
                 entries,
                 key=lambda item: (
                     fully_located and item.filename not in known_entries,
+                    item.filename not in declared_entries,
                     item.file_size,
                     preferred_archives.index(item.filename)
                     if item.filename in preferred_archives

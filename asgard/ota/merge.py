@@ -13,7 +13,7 @@ from ..cli.progress import print_info
 from ..core.errors import FUSError
 from .a_only import apply_block_ota, block_direct_files, block_partitions, block_source_members, validate_block_targets
 from .ab import apply_payload, payload_partitions, validate_payload_targets
-from .metadata import read_ota_metadata, resolve_base_firmware
+from .metadata import read_ota_metadata, resolve_base_firmware, source_archive_hints
 from .models import OtaMergeResult, OtaPlan
 from .sources import _download_sources, _local_sources
 from .state import completed_outputs
@@ -261,7 +261,7 @@ def download_and_merge_ota(
                 resume=resume,
                 timeout_s=timeout_s,
                 rate_limit=rate_limit,
-                preferred_archives=(plan.metadata.source_csc_name, plan.metadata.source_ap_name),
+                preferred_archives=source_archive_hints(plan.metadata),
                 source_cache=output_dir / ".asgard-ota-sources.json",
             )
         result = merge_ota(
