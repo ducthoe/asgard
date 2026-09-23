@@ -6,7 +6,6 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-import shutil
 import struct
 import zipfile
 from collections import Counter
@@ -17,13 +16,15 @@ from pathlib import Path
 
 from ...cli.progress import print_info
 from ...core.errors import FUSError
-from ..inplace import prepare_image, zero_range
+from ...core.resources import ota_worker_count
+from ..inplace import prepare_image, write_all, zero_range
 from ..models import OtaFile, OtaPartition
 from ..patch import apply_bsdiff
 from ..state import save_outputs
 
 _BLOCK_SIZE = 4096
 _COPY_SIZE = 4 * 1024 * 1024
+_RANGE_READ_SIZE = 16 * 1024 * 1024
 _ZIP_LOCAL_HEADER = struct.Struct("<I5H3I2H")
 _ZIP_LOCAL_MAGIC = 0x04034B50
 _TRANSFER_SUFFIX = ".transfer.list"
@@ -237,29 +238,35 @@ def block_source_members(path_value: str | Path) -> dict[str, str]:
         return result
 
 
-def _read_ranges(source, ranges: _Ranges) -> bytes:
-    output = bytearray(ranges.blocks * _BLOCK_SIZE)
+def _read_ranges_into(source, ranges: _Ranges, output: memoryview) -> None:
     position = 0
     for start, end in ranges.values:
         size = (end - start) * _BLOCK_SIZE
         source.seek(start * _BLOCK_SIZE)
-        chunk = source.read(size)
-        if len(chunk) != size:
-            raise FUSError("base image is shorter than an OTA source range")
-        output[position : position + size] = chunk
-        position += size
+        stop = position + size
+        while position < stop:
+            received = source.readinto(output[position : min(stop, position + _RANGE_READ_SIZE)])
+            if not received:
+                raise FUSError("base image is shorter than an OTA source range")
+            position += received
+
+
+def _read_ranges(source, ranges: _Ranges) -> bytes:
+    output = bytearray(ranges.blocks * _BLOCK_SIZE)
+    _read_ranges_into(source, ranges, memoryview(output))
     return bytes(output)
 
 
-def _write_ranges(output, ranges: _Ranges, data: bytes) -> None:
+def _write_ranges(output, ranges: _Ranges, data: bytes | bytearray) -> None:
     size = ranges.blocks * _BLOCK_SIZE
     if len(data) != size:
         raise FUSError(f"OTA command output size mismatch: expected {size}, got {len(data)}")
     position = 0
+    view = memoryview(data)
     for start, end in ranges.values:
         amount = (end - start) * _BLOCK_SIZE
         output.seek(start * _BLOCK_SIZE)
-        output.write(data[position : position + amount])
+        output.write(view[position : position + amount])
         position += amount
 
 
@@ -286,9 +293,10 @@ def _place_ranges(target: bytearray, locations: _Ranges, source: bytes) -> None:
     if any(end * _BLOCK_SIZE > len(target) for _, end in locations.values):
         raise FUSError("OTA source location exceeds its buffer")
     position = 0
+    view = memoryview(source)
     for start, end in locations.values:
         amount = (end - start) * _BLOCK_SIZE
-        target[start * _BLOCK_SIZE : end * _BLOCK_SIZE] = source[position : position + amount]
+        target[start * _BLOCK_SIZE : end * _BLOCK_SIZE] = view[position : position + amount]
         position += amount
 
 
@@ -336,13 +344,13 @@ def _source_spec(tokens: list[str], digest: str) -> tuple[_Ranges, _SourceSpec]:
     return target, _SourceSpec(digest.lower(), blocks, ranges, locations, tuple(stashes))
 
 
-def _load_source(output, source: _SourceSpec, stashes: dict[str, bytes], *, verify: bool) -> bytes:
+def _load_source(output, source: _SourceSpec, stashes: dict[str, bytes], *, verify: bool) -> bytearray:
     result = bytearray(source.blocks * _BLOCK_SIZE)
     if source.ranges.blocks:
-        raw = _read_ranges(output, source.ranges)
         if source.locations is None:
-            result[: len(raw)] = raw
+            _read_ranges_into(output, source.ranges, memoryview(result)[: source.ranges.blocks * _BLOCK_SIZE])
         else:
+            raw = _read_ranges(output, source.ranges)
             _place_ranges(result, source.locations, raw)
     for stash in source.stashes:
         try:
@@ -350,10 +358,9 @@ def _load_source(output, source: _SourceSpec, stashes: dict[str, bytes], *, veri
         except KeyError as exc:
             raise FUSError(f"OTA stash is unavailable: {stash.name}") from exc
         _place_ranges(result, stash.locations, raw)
-    data = bytes(result)
-    if verify and source.digest and hashlib.sha1(data).hexdigest() != source.digest:
+    if verify and source.digest and hashlib.sha1(result).hexdigest() != source.digest:
         raise FUSError("OTA source range hash mismatch")
-    return data
+    return result
 
 
 def _validate_transfer(archive: zipfile.ZipFile, transfer: _Transfer) -> None:
@@ -498,10 +505,10 @@ def _apply_transfer(
                         stashes.pop(tokens[0], None)
                     elif command == "move":
                         target, source = _source_spec(tokens[1:], tokens[0])
+                        if verify and not source.digest:
+                            raise FUSError(f"OTA move target hash mismatch for {transfer.name}")
                         result = _load_source(output, source, stashes, verify=verify)
                         _write_ranges(output, target, result)
-                        if verify and hashlib.sha1(result).hexdigest() != tokens[0].lower():
-                            raise FUSError(f"OTA move target hash mismatch for {transfer.name}")
                     else:
                         if patch_fd < 0:
                             raise FUSError(f"patch-data stream is missing for {transfer.name}")
@@ -546,8 +553,10 @@ def _apply_transfer(
 def _sha1_file(path: Path) -> str:
     digest = hashlib.sha1()
     with path.open("rb") as source:
-        while chunk := source.read(_COPY_SIZE):
-            digest.update(chunk)
+        buffer = bytearray(min(_COPY_SIZE, max(1, os.fstat(source.fileno()).st_size)))
+        view = memoryview(buffer)
+        while size := source.readinto(buffer):
+            digest.update(view[:size])
     return digest.hexdigest()
 
 
@@ -581,6 +590,7 @@ def _apply_partition_patch(
     result = apply_bsdiff(source_path.read_bytes(), patch, expected_size=spec.size)
     if verify and hashlib.sha1(result).hexdigest() != spec.target_digest:
         raise FUSError(f"target {spec.name} hash mismatch")
+    output_digest = hashlib.sha256(result).hexdigest()
     part_path = destination.with_name(f"{destination.name}.part")
     part_path.unlink(missing_ok=True)
     try:
@@ -591,7 +601,10 @@ def _apply_partition_patch(
             output.flush()
             os.fsync(output.fileno())
         part_path.replace(destination)
-        save_outputs(ota_path, output_dir, (destination,), verify=verify)
+        save_outputs(
+            ota_path, output_dir, (destination,), verify=verify,
+            precomputed_hashes={destination.name: output_digest},
+        )
     except Exception:
         part_path.unlink(missing_ok=True)
         raise
@@ -615,9 +628,11 @@ def _copy_direct_entry(
                 import zlib
 
                 crc = 0
+                buffer = bytearray(min(_COPY_SIZE, max(1, size)))
+                view = memoryview(buffer)
                 with destination.open("rb") as existing:
-                    while chunk := existing.read(_COPY_SIZE):
-                        crc = zlib.crc32(chunk, crc)
+                    while received := existing.readinto(buffer):
+                        crc = zlib.crc32(view[:received], crc)
                 if crc == archive.getinfo(entry).CRC:
                     return destination, True
             if not force:
@@ -626,14 +641,22 @@ def _copy_direct_entry(
         part_path = destination.with_name(f"{destination.name}.part")
         part_path.unlink(missing_ok=True)
         try:
+            digest = hashlib.sha256()
+            copied = 0
             with archive.open(entry) as source, part_path.open("xb") as output:
-                shutil.copyfileobj(source, output, _COPY_SIZE)
+                while chunk := source.read(_COPY_SIZE):
+                    digest.update(chunk)
+                    write_all(output, chunk)
+                    copied += len(chunk)
                 output.flush()
                 os.fsync(output.fileno())
-            if part_path.stat().st_size != size:
+            if copied != size or part_path.stat().st_size != size:
                 raise FUSError(f"OTA entry size mismatch: {entry}")
             part_path.replace(destination)
-            save_outputs(ota_path, output_dir, (destination,), verify=verify)
+            save_outputs(
+                ota_path, output_dir, (destination,), verify=verify,
+                precomputed_hashes={destination.name: digest.hexdigest()},
+            )
         except Exception:
             part_path.unlink(missing_ok=True)
             raise
@@ -647,7 +670,7 @@ def apply_block_ota(
     *,
     partitions: tuple[str, ...] | None = None,
     files: tuple[str, ...] | None = None,
-    jobs: int = 4,
+    jobs: int | None = None,
     verify: bool = True,
     resume: bool = False,
     force: bool = False,
@@ -680,7 +703,8 @@ def apply_block_ota(
     if len(set(output_names)) != len(output_names):
         raise FUSError("OTA targets have conflicting output filenames")
     tasks = []
-    with ThreadPoolExecutor(max_workers=max(1, jobs)) as executor:
+    worker_budget = ota_worker_count() if jobs is None else max(1, int(jobs))
+    with ThreadPoolExecutor(max_workers=worker_budget) as executor:
         for transfer in transfers:
             if transfer.name in selected:
                 source = base_images.get(transfer.name)

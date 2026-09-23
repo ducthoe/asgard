@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 
 from ..core.errors import FUSError
+from ..core.streaming import is_zero_data
 
 try:
     _fallocate = ctypes.CDLL(None, use_errno=True).fallocate
@@ -68,7 +69,7 @@ def prepare_image(source: Path, destination: Path, *, consume: bool) -> None:
                 chunk = incoming.read(min(4 * 1024 * 1024, end - start))
                 if not chunk:
                     raise FUSError(f"truncated base image: {source}")
-                if chunk.count(0) == len(chunk):
+                if is_zero_data(chunk):
                     outgoing.seek(len(chunk), os.SEEK_CUR)
                 else:
                     outgoing.write(chunk)

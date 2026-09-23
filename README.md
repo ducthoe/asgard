@@ -5,161 +5,65 @@ SPDX-License-Identifier: GPL-3.0-only
 
 # Asgard
 
-Asgard is a command-line client for downloading and inspecting Samsung firmware
-from the Firmware Update Server (FUS). It can decrypt firmware packages, inspect
-remote archives, extract individual files, and unpack logical partitions from
-Android super images without downloading the complete package first.
+Asgard is a command-line tool for getting Samsung firmware from the Firmware
+Update Server (FUS). You can check what is available, download and decrypt a
+package, or pull out the files and partitions you need without downloading the
+whole thing.
 
-## Features
+It can also combine an over-the-air (OTA) update with its base firmware to
+produce updated images, check local files, and write JSON manifests. Most
+commands can return JSON if you want to use Asgard in a script.
 
-- Query the latest firmware version for a model and CSC.
-- Display and compare firmware release histories.
-- Download encrypted or decrypted firmware with resume support.
-- Inspect remote ZIP and TAR archives.
-- Extract selected firmware archives or individual files.
-- Decode LZ4-compressed and Android sparse images while extracting them.
-- List and extract logical partitions from Android super images.
-- Merge A/B payload and block OTAs with selectively downloaded base images.
-- Verify local firmware files and generate JSON manifests.
-- Save frequently used model and CSC combinations as profiles.
-- Process multiple download jobs from TOML or JSON files.
-- Produce machine-readable JSON output for automation.
-
-## Installation
-
-Install the package from PyPI:
+## Install
 
 ```console
 python3 -m pip install asgard-fus
-```
-
-Verify the installation:
-
-```console
 asgard --help
 ```
 
-## Quick start
+## Start here
 
-Check for the latest firmware available for a model and CSC:
+You will usually need a device model and a CSC (region or carrier code). For
+example, `SM-S721B` and `EUX`:
 
 ```console
 asgard checkupdate SM-S721B EUX
-```
-
-Download and decrypt the latest firmware:
-
-```console
 asgard download SM-S721B EUX --decrypt --resume --output ./downloads
 ```
 
-List the files in the remote firmware package:
+The first command checks the latest version. The second downloads it, decrypts
+it, and saves it in `./downloads`. If the transfer stops, run the same download
+command again with `--resume`.
 
-```console
-asgard download SM-S721B EUX --list-entries
-```
-
-Run `asgard COMMAND --help` for the complete set of options supported by a
+Run `asgard COMMAND --help` whenever you need the full list of options for a
 command.
 
-## Usage
+## Find a firmware version
 
-### OTA merging
-
-Supply an OTA ZIP alongside a download to reconstruct its updated images:
-
-```console
-asgard download SM-S938U VZW --ota update.zip --output ./updated
-```
-
-Asgard detects the OTA format and matches its AP/CSC versions against firmware
-history to obtain the complete base version, including the fourth component. If
-history has no unique complete match, supply a four-part `--firmware` explicitly.
-Asgard streams the required images from FUS, and verifies patch source data and
-available target hashes.
-Base images are located from archive contents and `super` metadata, including
-device-specific partition names; archive locations are not inferred from names.
-It merges all OTA partitions and full image files by default. It does not build
-a flashable Odin package or flash the device.
-
-Inspect available targets or select only the outputs you need:
-
-```console
-asgard ota-info update.zip
-asgard download SM-S938U VZW --ota update.zip --ota-list-targets
-asgard download SM-S938U VZW --ota update.zip --ota-partition 'system,vendor' --output ./updated
-asgard download SM-S908B EUX --ota update.zip --ota-file 'vbmeta*' --output ./updated
-```
-
-`--ota-partition` and `--ota-file` accept repeated selectors, comma-separated
-names, and quoted glob patterns. Once either is supplied, only matching targets
-are produced. Full-replacement targets require no base download.
-
-Downloaded images become the merge output in place. A/B operations are ordered
-to preserve their source data. A/B dependency buffers and block-OTA stashes stay
-entirely in RAM, without application-managed spill files. Individual patch
-operations also need working memory; reduce `--ota-jobs` or select fewer partitions
-if RAM is limited. The operating system may still swap memory according to its settings.
-Compressed firmware packages and `super.img` are not staged to disk.
-
-Use `--ota-base-dir DIR` for existing base images, or repeat
-`--ota-base-image PARTITION=PATH` to supply individual images. Local raw images
-remain unchanged; LZ4 and Android sparse inputs are decoded automatically.
-Slotted base images prefer `_a` automatically; `--ota-base-image` overrides this.
-`--ota-keep-base` explicitly retains downloaded bases, using separate outputs.
-
-`--resume` checks completed outputs before reusing them. Interrupted merges
-restart from their base; they do not resume from partially patched images.
-`--ota-jobs N` overrides automatic worker selection, and `--ota-force` permits
-replacing existing outputs or overriding the declared base version. Source hash
-checks still apply unless `--ota-no-verify` is explicitly supplied.
-
-Supported payload operations are REPLACE, REPLACE_BZ, REPLACE_XZ, SOURCE_COPY,
-SOURCE_BSDIFF, BROTLI_BSDIFF, ZERO, and DISCARD. Block OTAs support BSDIFF patches,
-move, new, zero, erase, stash, and free commands. Unsupported operations and
-payloads requiring generated verity/FEC data are rejected before base downloads.
-ZIP contents and hashes are checked; OTA signing certificates are not authenticated.
-
-### Firmware information
-
-Display the latest firmware version:
+Check the latest release, browse older releases, or compare the release
+histories of two CSCs:
 
 ```console
 asgard checkupdate SM-S721B EUX
-```
-
-Display the release history:
-
-```console
 asgard history SM-S721B EUX
-asgard history SM-S721B EUX --json
-```
-
-Compare the histories of two CSCs:
-
-```console
 asgard compare SM-S721B EUX ZTO
-asgard compare SM-S721B EUX ZTO --json
 ```
 
-Use `--firmware-a` and `--firmware-b` to compare specific releases instead of
-the latest releases.
+`history` and `compare` also support `--json`. With `compare`, use
+`--firmware-a` and `--firmware-b` if you want to compare specific releases
+instead of the latest ones.
 
-### Firmware downloads
+## Download firmware
 
-Download the latest encrypted package:
+Without `--decrypt`, Asgard saves the encrypted package. Add `--decrypt` to
+get a decrypted ZIP in the same run:
 
 ```console
 asgard download SM-S721B EUX --output ./downloads --resume
+asgard download SM-S721B EUX --decrypt --output ./downloads --resume
 ```
 
-Download and decrypt the package in one operation:
-
-```console
-asgard download SM-S721B EUX --output ./downloads --decrypt --resume
-```
-
-Download a specific firmware version:
+To download an older release, pass its full firmware version:
 
 ```console
 asgard download SM-S721B EUX \
@@ -167,114 +71,146 @@ asgard download SM-S721B EUX \
   --output ./downloads
 ```
 
-The following options control download behavior:
+Downloads use a small number of workers by default: at most four for a large
+file, and fewer when the file or system is smaller. Asgard starts with fewer
+active streams, opens more when requests succeed, and slows down after HTTP
+429 or 503 responses. When the server sends `Retry-After`, Asgard follows it.
+You can set your own worker limit with `--threads N`, though a high value may
+slow a download or trigger more rate limits.
 
-| Option | Description |
+Useful download options:
+
+| Option | What it does |
 | --- | --- |
-| `--resume` | Resume an interrupted download or extraction operation. |
-| `--threads N` | Use a fixed limit of `N` download workers, or `N` decryption workers. |
-| `--timeout SECONDS` | Set the network request timeout. |
-| `--limit-rate RATE` | Limit the aggregate transfer rate, for example `500K`, `10M`, or `1GiB`. |
-| `--quiet` | Suppress informational and progress output. |
-| `--json` | Write machine-readable JSON to standard output. |
+| `--resume` | Continues an interrupted download or extraction. |
+| `--threads N` | Sets the worker limit for downloading or decrypting. |
+| `--timeout SECONDS` | Sets the network request timeout. |
+| `--limit-rate RATE` | Caps total transfer speed, for example `500K`, `10M`, or `1GiB`. |
+| `--quiet` | Hides progress and informational output. |
+| `--json` | Writes machine-readable output. |
 
-Full downloads use four workers by default; `--threads` overrides this limit.
-Workers share 16–128 MiB ranges based on remaining size and worker count, so
-faster connections can pick up more work. Larger requests reduce handoff pauses
-on large downloads. Adjacent unfinished ranges are combined when resuming.
+You can change `--threads` between resumed runs. Keep both the partial data
+file and its `.resume.json` file; Asgard needs them to continue the download.
 
-Resume progress is independent of worker count. You can change `--threads`
-between runs; valid progress from older resume files is retained too. The
-partial data file and its `.resume.json` file must both be present.
+## Get files from a package
 
-### Archive inspection and extraction
-
-List the archives in a firmware package:
+You can inspect a remote package before deciding what to download:
 
 ```console
 asgard download SM-S721B EUX --list-entries
-```
-
-List the files in the AP archive:
-
-```console
 asgard download SM-S721B EUX --archive AP --list-entries
 ```
 
-Download one or more archives. Archive selectors accept names and glob
-patterns:
+The first command lists the package's archives. The second lists files inside
+the AP archive. To download an archive, choose it by name or with a quoted glob
+pattern:
 
 ```console
 asgard download SM-S721B EUX --archive BL --output ./downloads --resume
 asgard download SM-S721B EUX --archive '*.zip' --output ./downloads --resume
 ```
 
-Extract a single file from an archive:
+You can also extract one file directly:
 
 ```console
 asgard download SM-S721B EUX \
-  --archive AP \
-  --file super.img.lz4 \
-  --output ./downloads \
-  --resume
+  --archive AP --file super.img.lz4 \
+  --output ./downloads --resume
 ```
 
-LZ4 and Android sparse images are decoded automatically. Pass `--keep-sparse`
-to retain the Android sparse representation:
+Asgard decodes LZ4 compression and Android sparse images during extraction.
+Add `--keep-sparse` if you want the Android sparse form of an image:
 
 ```console
 asgard download SM-S721B EUX \
-  --archive AP \
-  --file super.img.lz4 \
-  --keep-sparse \
-  --output ./downloads \
-  --resume
+  --archive AP --file super.img.lz4 --keep-sparse \
+  --output ./downloads --resume
 ```
 
-### Super images
+### Logical partitions in a super image
 
-List the logical partitions in the super image contained in an archive:
+List the partitions first, then extract the ones you want:
 
 ```console
 asgard download SM-S721B EUX --archive AP --list-partitions
+asgard download SM-S721B EUX \
+  --archive AP --partition system --partition vendor \
+  --output ./downloads --resume
 ```
 
-Extract selected logical partitions:
+Use `--unpack-super` to extract every logical partition:
 
 ```console
 asgard download SM-S721B EUX \
-  --archive AP \
-  --partition system \
-  --partition vendor \
-  --output ./downloads \
-  --resume
+  --archive AP --unpack-super --output ./downloads --resume
 ```
 
-Extract every logical partition:
+For resumed extraction, Asgard keeps the source stream locally so it can
+rebuild decoded output without fetching the same source data again.
+
+## Apply an OTA update
+
+Give Asgard an OTA ZIP and the model and CSC of its base firmware:
 
 ```console
-asgard download SM-S721B EUX \
-  --archive AP \
-  --unpack-super \
-  --output ./downloads \
-  --resume
+asgard download SM-S938U VZW --ota update.zip --output ./updated
 ```
 
-When extraction is resumed, Asgard preserves the source stream locally. This
-allows transformed LZ4 and sparse outputs to be rebuilt without downloading the
-source data again.
+Asgard reads the OTA, finds the matching base release in firmware history, and
+downloads the base images it needs from FUS. If the history does not give a
+single full version, pass the four-part version with `--firmware`. You can also
+provide local base images with `--ota-base-dir DIR` or by repeating
+`--ota-base-image PARTITION=PATH`. Local raw images stay unchanged; LZ4 and
+Android sparse inputs are decoded as needed. For slotted images, Asgard prefers
+the `_a` base unless you supply an image explicitly.
 
-### Decryption
+By default, Asgard produces every partition and full image in the OTA. Use
+these commands to see the targets and choose only the ones you need:
 
-Decrypt an existing FUS package:
+```console
+asgard ota-info update.zip
+asgard download SM-S938U VZW --ota update.zip --ota-list-targets
+asgard download SM-S938U VZW --ota update.zip \
+  --ota-partition 'system,vendor' --output ./updated
+asgard download SM-S908B EUX --ota update.zip \
+  --ota-file 'vbmeta*' --output ./updated
+```
+
+`--ota-partition` and `--ota-file` can be repeated. They accept comma-separated
+names and quoted glob patterns. Once you select a target, Asgard produces only
+matching targets. A full-replacement target needs no base image.
+
+Asgard writes downloaded base images into the merge output. Add
+`--ota-keep-base` if you want separate copies of those bases. `--resume` can
+reuse finished outputs, but an interrupted patch starts again from its base
+image. Asgard does not build an Odin package or flash a device.
+
+OTA work uses a CPU-based worker count by default. If `psutil` is installed,
+available memory also limits the count. Use `--ota-jobs N` to choose a limit
+yourself. OTA patching can use substantial RAM, especially with several
+partitions at once; choose fewer targets or lower `--ota-jobs` if memory is
+tight. Asgard streams compressed firmware packages and super images without
+staging them to disk.
+
+Asgard checks patch source data, available target hashes, and ZIP contents.
+`--ota-force` lets you replace existing outputs or override the declared base
+version. Source hash checks still run unless you add `--ota-no-verify`.
+OTA signing certificates are not authenticated.
+
+Supported A/B payload operations are REPLACE, REPLACE_BZ, REPLACE_XZ,
+SOURCE_COPY, SOURCE_BSDIFF, BROTLI_BSDIFF, ZERO, and DISCARD. Block OTAs
+support BSDIFF patches and move, new, zero, erase, stash, and free commands.
+Asgard rejects unsupported operations and payloads that need generated
+verity/FEC data before downloading base images.
+
+## Decrypt a package you already have
 
 ```console
 asgard decrypt SM-S721B EUX ./firmware.zip.enc4 \
-  --output ./firmware.zip \
-  --resume
+  --output ./firmware.zip --resume
 ```
 
-Specify the firmware version when the package is not the latest release:
+If the package is from an older release, give its version:
 
 ```console
 asgard decrypt SM-S721B EUX ./firmware.zip.enc4 \
@@ -282,39 +218,28 @@ asgard decrypt SM-S721B EUX ./firmware.zip.enc4 \
   --output ./firmware.zip
 ```
 
-Use `--enc-ver 2` for ENC2 packages. ENC2 decryption always requires an
-explicit firmware version.
+For an ENC2 package, add `--enc-ver 2` and always provide the firmware version.
 
-## Profiles
+## Save a model and CSC as a profile
 
-Profiles assign a name to a model and CSC combination:
+If you use the same device often, give its model and CSC a name:
 
 ```console
 asgard profile add my-phone SM-S721B EUX
 asgard profile list
 asgard profile show my-phone
-```
-
-The profile name can then be used in place of the model and CSC:
-
-```console
 asgard checkupdate my-phone
 asgard download my-phone --output ./downloads --resume
 ```
 
-Remove a profile when it is no longer required:
+Remove it with `asgard profile remove my-phone`. Profiles live in
+`$XDG_CONFIG_HOME/asgard` when `XDG_CONFIG_HOME` is set, or in
+`~/.config/asgard` otherwise.
 
-```console
-asgard profile remove my-phone
-```
+## Run several downloads
 
-Profiles are stored in `$XDG_CONFIG_HOME/asgard` when `XDG_CONFIG_HOME` is set,
-or in `~/.config/asgard` otherwise.
-
-## Batch downloads
-
-Batch files may be written in TOML or JSON. A TOML batch file uses one
-`[[downloads]]` table for each job:
+Put jobs in a TOML or JSON file. A TOML file has one `[[downloads]]` table per
+job:
 
 ```toml
 [[downloads]]
@@ -333,62 +258,53 @@ threads = 4
 limit_rate = "20M"
 ```
 
-Run the batch:
-
 ```console
 asgard batch firmware.toml
-```
-
-Validate the jobs without downloading any files:
-
-```console
 asgard batch firmware.toml --dry-run --json
 ```
 
-A JSON batch file may contain either an array of job objects or an object with a
-`downloads` array.
+`--dry-run` checks the jobs without downloading. A JSON batch file can be an
+array of jobs or an object with a `downloads` array.
 
-## Verification and manifests
+## Check files and write manifests
 
-Verify a local package or image:
+Check a local package or image with `verify`:
 
 ```console
 asgard verify ./firmware.zip
 asgard verify ./super.img --json
 ```
 
-Verification calculates SHA-256 and MD5 digests. It also validates ZIP CRCs,
-TAR structure, AES block alignment for encrypted FUS packages, and Android
-sparse-image structure where applicable.
+Asgard calculates SHA-256 and MD5 hashes. Where applicable, it also checks
+ZIP CRCs, TAR structure, AES block alignment for encrypted FUS packages, and
+Android sparse-image structure.
 
-Generate a JSON manifest for an existing file:
+Use `manifest` to write a JSON record for a file:
 
 ```console
 asgard manifest ./firmware.zip \
-  --model SM-S721B \
-  --region EUX \
+  --model SM-S721B --region EUX \
   --firmware S721BXXSACZB2/S721BOXMACZB2/S721BXXSACZB2/S721BXXSACZB2
 ```
 
-Generate a manifest when downloading or decrypting firmware:
+Or add `--manifest` to a download or decryption command:
 
 ```console
 asgard download SM-S721B EUX --decrypt --output ./downloads --manifest
 ```
 
-Manifests contain hashes and archive entry metadata. A manifest generated for
-`super.img` or `super.img.lz4` also contains logical partition metadata.
+Manifests include hashes and archive entry details. For `super.img` and
+`super.img.lz4`, they also include logical partition details.
 
-## Exit status
+## Exit codes
 
-Asgard exits with status `0` when a command completes successfully. Invalid
-usage and missing input files return status `2`; operational and network errors
-return status `1`.
+`0` means the command succeeded. `2` means invalid usage or a missing input
+file. `1` means an operation or network request failed.
 
 ## Contributing
 
-Bug reports and pull requests are welcome. Before submitting a change, run the
-configured linter:
+Bug reports and pull requests are welcome. Run the linter before submitting a
+change:
 
 ```console
 ruff check asgard
@@ -397,4 +313,4 @@ ruff check asgard
 ## License
 
 Asgard is licensed under the GNU General Public License v3.0 only. See
-[`LICENSE`](LICENSE) for the complete license text.
+[`LICENSE`](LICENSE) for the full text.

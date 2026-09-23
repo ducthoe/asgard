@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
+import stat
 import struct
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,6 +53,8 @@ from ..core.streaming import (
     write_data_or_holes,
 )
 from .sparse_format import _copy_sparse_stream, _SparseRawReader
+
+_MAX_OPEN_SUPER_OUTPUTS = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,11 +113,13 @@ class _RawForwardReader:
         *,
         prefix: bytes,
         raw_size: int | None,
+        fast_seek: bool = False,
     ):
         self._source = source
         self._prefix = prefix
         self._prefix_offset = 0
         self._position = 0
+        self._fast_seek = fast_seek
         self.raw_size = raw_size if raw_size and raw_size >= len(prefix) else None
 
     def tell(self) -> int:
@@ -149,6 +155,14 @@ class _RawForwardReader:
         if self.raw_size is not None and offset > self.raw_size:
             raise FUSError(f"super image offset {offset} exceeds its raw size")
         remaining = offset - self._position
+        if self._fast_seek:
+            prefix_bytes = min(remaining, len(self._prefix) - self._prefix_offset)
+            self._prefix_offset += prefix_bytes
+            remaining -= prefix_bytes
+            if remaining:
+                self._source.seek(remaining, io.SEEK_CUR)
+            self._position = offset
+            return
         while remaining:
             amount = min(remaining, _ARCHIVE_COPY_CHUNK_SIZE)
             data = self.read(amount)
@@ -244,11 +258,19 @@ def _forward_image_reader(
     source: io.BufferedIOBase,
     *,
     raw_size: int | None,
+    fast_seek: bool = False,
 ) -> _RawForwardReader | _SparseRawReader:
     prefix = read_exact_stream(source, 4, "super image")
     if prefix == struct.pack("<I", _SPARSE_MAGIC):
         return _SparseRawReader(source, header_prefix=prefix)
-    return _RawForwardReader(source, prefix=prefix, raw_size=raw_size)
+    return _RawForwardReader(source, prefix=prefix, raw_size=raw_size, fast_seek=fast_seek)
+
+
+def _is_regular_seekable(source: io.BufferedIOBase) -> bool:
+    try:
+        return source.seekable() and stat.S_ISREG(os.fstat(source.fileno()).st_mode)
+    except (AttributeError, OSError, ValueError):
+        return False
 
 
 @contextmanager
@@ -274,6 +296,15 @@ def _open_super_image_reader(
                 open_prefetched_stream(decoded) as prefetched,
             ):
                 yield _forward_image_reader(prefetched, raw_size=raw_size or None)
+        elif _is_regular_seekable(source):
+            source_offset = source.tell()
+            prefix = source.read(4)
+            source.seek(source_offset)
+            if prefix != struct.pack("<I", _SPARSE_MAGIC):
+                yield _forward_image_reader(source, raw_size=member_size, fast_seek=True)
+            else:
+                with open_prefetched_stream(source) as prefetched:
+                    yield _forward_image_reader(prefetched, raw_size=member_size)
         else:
             with open_prefetched_stream(source) as prefetched:
                 yield _forward_image_reader(prefetched, raw_size=member_size)
@@ -718,31 +749,48 @@ def extract_super_partitions(
         renamed: list[Path] = []
         complete = False
         try:
-            for _destination, part_path in paths.values():
-                with part_path.open("xb"):
-                    pass
-            for span in spans:
-                while reader.tell() < span.source_offset:
-                    reader.skip_to(min(span.source_offset, reader.tell() + _ARCHIVE_COPY_CHUNK_SIZE))
-                    update_progress()
-                with paths[span.partition_name][1].open("r+b") as output:
-                    output.seek(span.destination_offset)
-                    remaining = span.size
-                    while remaining:
-                        amount = min(remaining, _ARCHIVE_COPY_CHUNK_SIZE)
-                        reader.copy_to(
-                            output,
-                            amount,
-                            hole_block_size=metadata.logical_block_size,
-                        )
-                        remaining -= amount
-                        update_progress()
-            if reader.raw_size is not None and reader.tell() == reader.raw_size:
-                reader.finish(require_eof=True)
-            update_progress(complete=True)
-            for name, (_destination, part_path) in paths.items():
-                with part_path.open("r+b") as output:
-                    output.truncate(sizes[name])
+            with ExitStack() as stack:
+                reuse_handles = len(paths) <= _MAX_OPEN_SUPER_OUTPUTS
+                outputs = {}
+                for name, (_destination, part_path) in paths.items():
+                    if reuse_handles:
+                        outputs[name] = stack.enter_context(part_path.open("xb+"))
+                    else:
+                        with part_path.open("xb"):
+                            pass
+                for span in spans:
+                    if isinstance(reader, _RawForwardReader) and reader._fast_seek:
+                        if reader.tell() < span.source_offset:
+                            reader.skip_to(span.source_offset)
+                            update_progress()
+                    else:
+                        while reader.tell() < span.source_offset:
+                            reader.skip_to(min(span.source_offset, reader.tell() + _ARCHIVE_COPY_CHUNK_SIZE))
+                            update_progress()
+                    output_context = (
+                        nullcontext(outputs[span.partition_name])
+                        if reuse_handles
+                        else paths[span.partition_name][1].open("r+b")
+                    )
+                    with output_context as output:
+                        output.seek(span.destination_offset)
+                        remaining = span.size
+                        while remaining:
+                            amount = min(remaining, _ARCHIVE_COPY_CHUNK_SIZE)
+                            reader.copy_to(
+                                output,
+                                amount,
+                                hole_block_size=metadata.logical_block_size,
+                            )
+                            remaining -= amount
+                            update_progress()
+                if reader.raw_size is not None and reader.tell() == reader.raw_size:
+                    reader.finish(require_eof=True)
+                update_progress(complete=True)
+                for name, (_destination, part_path) in paths.items():
+                    output_context = nullcontext(outputs[name]) if reuse_handles else part_path.open("r+b")
+                    with output_context as output:
+                        output.truncate(sizes[name])
             for partition in selected:
                 destination, part_path = paths[partition.name]
                 if destination.exists():

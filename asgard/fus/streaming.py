@@ -22,7 +22,7 @@ from ..core.constants import (
     _RATE_LIMIT_COOLDOWN_S,
     _RETRY_BACKOFF_S,
 )
-from ..core.errors import FUSError, RetryableDownloadError
+from ..core.errors import FUSError, RateLimitedError, RetryableDownloadError
 from .client import FUSClient
 from .crypto import _pkcs7_unpad
 
@@ -112,6 +112,10 @@ def _read_download_range(
         except (requests.RequestException, OSError, RetryableDownloadError) as exc:
             if attempt > _DOWNLOAD_RETRIES:
                 raise FUSError(f"range {start}-{end} failed after retries: {exc}") from exc
+            if isinstance(exc, RateLimitedError):
+                delay = min(120.0, _RATE_LIMIT_COOLDOWN_S * 2 ** min(attempt - 1, 5))
+                time.sleep(max(delay, exc.retry_after_s or 0.0))
+                continue
             if recover_download is not None and attempt % _DOWNLOAD_RECOVERY_INTERVAL == 0:
                 try:
                     recover_download()
@@ -301,6 +305,10 @@ class _FUSDecryptingReader(io.RawIOBase):
             self._stream_failures = 1
         if self._stream_failures > _DOWNLOAD_RETRIES:
             raise FUSError(f"firmware stream failed after retries at byte {self._position}: {exc}") from exc
+        if isinstance(exc, RateLimitedError):
+            delay = min(120.0, _RATE_LIMIT_COOLDOWN_S * 2 ** min(self._stream_failures - 1, 5))
+            time.sleep(max(delay, exc.retry_after_s or 0.0))
+            return
         if self._recover_download is not None and self._stream_failures % _DOWNLOAD_RECOVERY_INTERVAL == 0:
             try:
                 self._recover_download()

@@ -16,25 +16,13 @@ from Cryptodome.Cipher import AES
 from ..cli.progress import render_progress as _render_progress
 from ..core.constants import _AES_BLOCK_SIZE, _PROGRESS_REFRESH_S
 from ..core.errors import FUSError
+from ..core.resources import decrypt_worker_count
 from .auth import get_logic_check
 from .client import FUSClient
 from .firmware import _resolve_versioned_info
 from .models import BinaryInfo
 from .protocol import _upper_code, normalize_version_code
 from .resume import _partial_output_path, _prepare_range_resume_state, _resume_done_bytes, _save_range_resume_state
-
-
-def _available_worker_count() -> int:
-    try:
-        affinity = os.sched_getaffinity(0)
-    except (AttributeError, OSError):
-        affinity = None
-    if affinity:
-        return max(1, len(affinity))
-    return max(1, os.cpu_count() or 1)
-
-
-_DECRYPT_THREADS = _available_worker_count()
 
 
 def _md5_digest(text: str) -> bytes:
@@ -154,7 +142,7 @@ def decrypt_firmware(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.exists():
         raise FUSError(f"{out_path} already exists")
-    worker_count = _DECRYPT_THREADS if threads is None else int(threads)
+    worker_count = decrypt_worker_count() if threads is None else int(threads)
     if worker_count <= 0:
         raise ValueError("threads must be positive")
     if int(enc_ver) == 4:

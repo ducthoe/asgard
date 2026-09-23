@@ -12,13 +12,19 @@ _BSDIFF40 = b"BSDIFF40"
 _BSDF2 = b"BSDF2"
 
 
-def normalize_source_signature(source: bytes, expected: bytes, *, offset: int = 0, algorithm: str = "sha256") -> bytes:
+def normalize_source_signature(
+    source: bytes | bytearray, expected: bytes, *, offset: int = 0, algorithm: str = "sha256"
+) -> bytes | bytearray:
     if source[offset + 768 : offset + 779] != b"SignerVer02":
         return source
-    normalized = source[:offset] + bytes(256) + source[offset + 256 :]
-    if hashlib.new(algorithm, normalized).digest() == expected:
-        return normalized
-    return source
+    view = memoryview(source)
+    digest = hashlib.new(algorithm)
+    digest.update(view[:offset])
+    digest.update(bytes(256))
+    digest.update(view[offset + 256 :])
+    if digest.digest() != expected:
+        return source
+    return source[:offset] + bytes(256) + source[offset + 256 :]
 
 
 def _signed_int64(raw: bytes) -> int:
@@ -83,14 +89,14 @@ def _decode_patch(patch: bytes) -> tuple[int, list[tuple[int, int, int]], bytes,
     return target_size, triples, diff, extra
 
 
-def apply_bsdiff(source: bytes, patch: bytes, *, expected_size: int | None = None) -> bytes:
+def apply_bsdiff(source: bytes | bytearray, patch: bytes, *, expected_size: int | None = None) -> bytes:
     target_size, controls, diff, extra = _decode_patch(patch)
     if expected_size is not None and target_size != expected_size:
         raise FUSError(f"patch target size mismatch: expected {expected_size}, got {target_size}")
     try:
         from bsdiff4 import core
 
-        result = core.patch(source, target_size, controls, diff, extra)
+        result = core.patch(bytes(source), target_size, controls, diff, extra)
     except Exception as exc:
         raise FUSError(f"could not apply bsdiff patch: {exc}") from exc
     if len(result) != target_size:

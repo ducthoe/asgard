@@ -6,10 +6,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ..core.constants import _AES_BLOCK_SIZE, _DOWNLOAD_WORKERS
+from ..core.constants import _AES_BLOCK_SIZE
+from ..core.resources import download_worker_count
 from .scheduling import load_resume_ranges
-
-_DOWNLOAD_THREADS = _DOWNLOAD_WORKERS
 
 
 def _partial_output_path(path: Path) -> Path:
@@ -20,9 +19,11 @@ def _resume_state_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.resume.json")
 
 
-def _build_range_parts(total_size: int, part_count: int = _DOWNLOAD_THREADS) -> list[dict[str, int]]:
+def _build_range_parts(total_size: int, part_count: int | None = None) -> list[dict[str, int]]:
     if total_size <= 0:
         return []
+    if part_count is None:
+        part_count = download_worker_count(total_size)
     block_size = _AES_BLOCK_SIZE
     max_parts = max(1, total_size // block_size)
     parts = max(1, min(int(part_count), max_parts))
@@ -58,7 +59,7 @@ def _prepare_range_resume_state(
     total_size: int,
     resume: bool,
     *,
-    part_count: int = _DOWNLOAD_THREADS,
+    part_count: int | None = None,
     alignment: int = 1,
 ) -> tuple[list[dict[str, int]], Path]:
     meta_path = _resume_state_path(data_path)

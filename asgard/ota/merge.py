@@ -11,6 +11,7 @@ from pathlib import Path
 
 from ..cli.progress import print_info
 from ..core.errors import FUSError
+from ..core.resources import ota_worker_count
 from .a_only import apply_block_ota, block_direct_files, block_partitions, block_source_members, validate_block_targets
 from .ab import apply_payload, payload_partitions, validate_payload_targets
 from .metadata import read_ota_metadata, resolve_base_firmware, source_archive_hints
@@ -133,32 +134,27 @@ def _validate_model_and_base(
         raise FUSError(f"OTA requires base CSC {plan.metadata.base_csc}; {firmware_version} needs --ota-force")
 
 
-def merge_ota(
-    ota_path: str | Path,
-    output: str | Path,
+def _merge_prepared_ota(
+    plan: OtaPlan,
+    output_dir: Path,
     base_images: dict[str, Path],
     *,
-    partitions: tuple[str, ...] | None = None,
-    files: tuple[str, ...] | None = None,
-    jobs: int = 4,
-    forced_type: str = "auto",
-    verify: bool = True,
-    resume: bool = False,
-    force: bool = False,
-    consume_base: frozenset[str] = frozenset(),
+    selected: tuple[str, ...],
+    selected_files: tuple[str, ...],
+    expected_names: tuple[str, ...],
+    completed: dict[str, Path],
+    jobs: int,
+    verify: bool,
+    resume: bool,
+    force: bool,
+    consume_base: frozenset[str],
 ) -> OtaMergeResult:
-    plan = inspect_ota(ota_path, forced_type=forced_type, verify=verify)
-    selected, selected_files = select_ota_targets(plan, partitions, files)
-    _validate_targets(plan, selected, verify=verify)
-    output_dir = Path(output).expanduser().resolve()
-    if output_dir.exists() and not output_dir.is_dir():
-        raise FUSError(f"OTA output must be a directory: {output_dir}")
     normalized = {name: Path(path).expanduser().resolve() for name, path in base_images.items()}
     output_names = {part.name: part.output_name for part in plan.partitions}
-    expected_names = _target_names(plan, selected, selected_files)
-    completed = completed_outputs(plan.metadata.path, output_dir, verify=verify, names=expected_names) if resume else {}
     _check_existing_outputs(output_dir, expected_names, completed, force=force)
-    target_paths = {(output_dir / (name + suffix)).resolve() for name in expected_names for suffix in ("", ".part")}
+    target_paths = {
+        (output_dir / (name + suffix)).resolve() for name in expected_names for suffix in ("", ".part")
+    }
     if any(path in target_paths for path in normalized.values()):
         raise FUSError("local base images must be separate from OTA output paths")
     prior = tuple(completed.values())
@@ -196,6 +192,44 @@ def merge_ota(
     return OtaMergeResult(plan.metadata, plan.metadata.base_firmware, paths, skipped)
 
 
+def merge_ota(
+    ota_path: str | Path,
+    output: str | Path,
+    base_images: dict[str, Path],
+    *,
+    partitions: tuple[str, ...] | None = None,
+    files: tuple[str, ...] | None = None,
+    jobs: int | None = None,
+    forced_type: str = "auto",
+    verify: bool = True,
+    resume: bool = False,
+    force: bool = False,
+    consume_base: frozenset[str] = frozenset(),
+) -> OtaMergeResult:
+    plan = inspect_ota(ota_path, forced_type=forced_type, verify=verify)
+    selected, selected_files = select_ota_targets(plan, partitions, files)
+    _validate_targets(plan, selected, verify=verify)
+    output_dir = Path(output).expanduser().resolve()
+    if output_dir.exists() and not output_dir.is_dir():
+        raise FUSError(f"OTA output must be a directory: {output_dir}")
+    expected_names = _target_names(plan, selected, selected_files)
+    completed = completed_outputs(plan.metadata.path, output_dir, verify=verify, names=expected_names) if resume else {}
+    return _merge_prepared_ota(
+        plan,
+        output_dir,
+        base_images,
+        selected=selected,
+        selected_files=selected_files,
+        expected_names=expected_names,
+        completed=completed,
+        jobs=ota_worker_count() if jobs is None else jobs,
+        verify=verify,
+        resume=resume,
+        force=force,
+        consume_base=consume_base,
+    )
+
+
 def download_and_merge_ota(
     *,
     ota_path: str | Path,
@@ -207,7 +241,7 @@ def download_and_merge_ota(
     base_images: dict[str, Path] | None = None,
     partitions: tuple[str, ...] | None = None,
     files: tuple[str, ...] | None = None,
-    jobs: int = 4,
+    jobs: int | None = None,
     forced_type: str = "auto",
     verify: bool = True,
     resume: bool = False,
@@ -264,14 +298,15 @@ def download_and_merge_ota(
                 preferred_archives=source_archive_hints(plan.metadata),
                 source_cache=output_dir / ".asgard-ota-sources.json",
             )
-        result = merge_ota(
-            plan.metadata.path,
+        result = _merge_prepared_ota(
+            plan,
             output_dir,
             sources,
-            partitions=selected,
-            files=selected_files,
-            jobs=jobs,
-            forced_type=forced_type,
+            selected=selected,
+            selected_files=selected_files,
+            expected_names=expected_names,
+            completed=completed,
+            jobs=ota_worker_count() if jobs is None else jobs,
             verify=verify,
             resume=resume,
             force=force,

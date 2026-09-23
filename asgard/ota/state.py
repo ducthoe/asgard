@@ -17,8 +17,10 @@ _STATE_LOCK = threading.Lock()
 def image_hash(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
-        while chunk := source.read(4 * 1024 * 1024):
-            digest.update(chunk)
+        buffer = bytearray(min(4 * 1024 * 1024, max(1, os.fstat(source.fileno()).st_size)))
+        view = memoryview(buffer)
+        while size := source.readinto(buffer):
+            digest.update(view[:size])
     return digest.hexdigest()
 
 
@@ -50,8 +52,16 @@ def completed_outputs(
         return {}
 
 
-def save_outputs(ota: Path, output: Path, paths: tuple[Path, ...], *, verify: bool = True) -> None:
-    hashes = {path.name: image_hash(path) for path in paths}
+def save_outputs(
+    ota: Path,
+    output: Path,
+    paths: tuple[Path, ...],
+    *,
+    verify: bool = True,
+    precomputed_hashes: dict[str, str] | None = None,
+) -> None:
+    precomputed = precomputed_hashes or {}
+    hashes = {path.name: precomputed[path.name] if path.name in precomputed else image_hash(path) for path in paths}
     identity = ota_identity(ota)
     with _STATE_LOCK:
         try:

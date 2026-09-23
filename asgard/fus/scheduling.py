@@ -3,13 +3,85 @@
 
 from __future__ import annotations
 
-from ..core.constants import _AES_BLOCK_SIZE, _DOWNLOAD_MIN_RANGE_SIZE, _DOWNLOAD_RANGE_SIZE, _DOWNLOAD_WORKERS
+import threading
+import time
+from math import isqrt
+
+from ..core.constants import (
+    _AES_BLOCK_SIZE,
+    _DOWNLOAD_MIN_RANGE_SIZE,
+    _DOWNLOAD_RANGE_SIZE,
+    _RATE_LIMIT_COOLDOWN_S,
+)
+from ..core.resources import download_worker_count
 
 
-def split_download_ranges(ranges: list[dict[str, int]], *, workers: int = _DOWNLOAD_WORKERS) -> list[dict[str, int]]:
+class AdaptiveDownloadGate:
+    """Probe for useful concurrency and make throttled workers cool down together."""
+
+    def __init__(self, max_workers: int):
+        if max_workers <= 0:
+            raise ValueError("threads must be positive")
+        self.max_workers = max_workers
+        self.limit = min(max_workers, max(1, isqrt(max_workers)))
+        self.active = 0
+        self._condition = threading.Condition()
+        self._cooldown_until = 0.0
+        self._last_throttle = 0.0
+        self._throttle_count = 0
+        self._successful_starts = 0
+        self._slow_start = True
+
+    def acquire(self, stop_event: threading.Event) -> bool:
+        with self._condition:
+            while not stop_event.is_set():
+                now = time.monotonic()
+                if self.active < self.limit and now >= self._cooldown_until:
+                    self.active += 1
+                    return True
+                delay = max(0.0, self._cooldown_until - now)
+                self._condition.wait(min(0.25, delay) if delay else 0.25)
+        return False
+
+    def release(self) -> None:
+        with self._condition:
+            self.active -= 1
+            self._condition.notify_all()
+
+    def accepted(self) -> None:
+        with self._condition:
+            if time.monotonic() < self._cooldown_until or self.limit >= self.max_workers:
+                return
+            self._successful_starts += 1
+            threshold = 1 if self._slow_start else self.limit
+            if self._successful_starts >= threshold:
+                self.limit += 1
+                self._successful_starts = 0
+                self._condition.notify_all()
+
+    def throttled(self, retry_after_s: float | None) -> None:
+        with self._condition:
+            now = time.monotonic()
+            if now >= self._cooldown_until:
+                if now - self._last_throttle >= 60:
+                    self._throttle_count = 0
+                self._throttle_count += 1
+                self._last_throttle = now
+                self.limit = max(1, self.limit // 2)
+                self._slow_start = False
+                self._successful_starts = 0
+            fallback = min(120.0, _RATE_LIMIT_COOLDOWN_S * 2 ** min(self._throttle_count - 1, 5))
+            delay = max(fallback, retry_after_s or 0.0)
+            self._cooldown_until = max(self._cooldown_until, now + delay)
+            self._condition.notify_all()
+
+
+def split_download_ranges(ranges: list[dict[str, int]], *, workers: int | None = None) -> list[dict[str, int]]:
+    remaining = sum(item["end"] + 1 - item["offset"] for item in ranges)
+    if workers is None:
+        workers = download_worker_count(remaining)
     if workers <= 0:
         raise ValueError("threads must be positive")
-    remaining = sum(item["end"] + 1 - item["offset"] for item in ranges)
     per_range = (remaining + workers * 4 - 1) // (workers * 4)
     per_range = (per_range + _AES_BLOCK_SIZE - 1) // _AES_BLOCK_SIZE * _AES_BLOCK_SIZE
     range_size = min(_DOWNLOAD_RANGE_SIZE, max(_DOWNLOAD_MIN_RANGE_SIZE, per_range))

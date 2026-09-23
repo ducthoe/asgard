@@ -12,6 +12,12 @@ class RetryableDownloadError(FUSError):
     pass
 
 
+class RateLimitedError(RetryableDownloadError):
+    def __init__(self, message: str, *, retry_after_s: float | None = None):
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
+
+
 class StreamSourceError(Exception):
     pass
 

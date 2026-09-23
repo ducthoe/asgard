@@ -10,6 +10,7 @@ _EXPORTS = {
     "BinaryInfo": (".models", "BinaryInfo"),
     "DownloadResult": (".models", "DownloadResult"),
     "FUSError": ("..core.errors", "FUSError"),
+    "RateLimitedError": ("..core.errors", "RateLimitedError"),
     "FUSClient": (".client", "FUSClient"),
     "FirmwareHistoryEntry": (".models", "FirmwareHistoryEntry"),
     "RetryableDownloadError": ("..core.errors", "RetryableDownloadError"),

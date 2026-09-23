@@ -146,7 +146,7 @@ def _add_network_options(parser: argparse.ArgumentParser, *, threads: bool = Fal
     parser.add_argument("--timeout", type=_positive_int, default=30, metavar="SECONDS")
     parser.add_argument("--limit-rate", type=_parse_byte_rate, metavar="RATE", help="Aggregate limit, e.g. 10M")
     if threads:
-        parser.add_argument("--threads", type=_positive_int, help="Download workers (default: 4), or decrypt workers")
+        parser.add_argument("--threads", type=_positive_int, help="Override automatic download or decrypt workers")
 
 
 def _add_manifest_option(parser: argparse.ArgumentParser) -> None:
@@ -255,7 +255,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="SELECTOR",
         help="Extract matching full OTA files; repeatable, commas/globs allowed",
     )
-    download.add_argument("--ota-jobs", type=_positive_int, metavar="N", help="Parallel OTA merge jobs")
+    download.add_argument("--ota-jobs", type=_positive_int, metavar="N", help="Override automatic OTA merge workers")
     download.add_argument("--ota-no-verify", action="store_true", help="Skip OTA source and target hashes")
     download.add_argument("--ota-keep-base", action="store_true", help="Keep downloaded base images")
     download.add_argument("--ota-force", action="store_true", help="Allow a base mismatch and replace outputs")
@@ -603,7 +603,7 @@ def _handle_download(args: argparse.Namespace, parser: argparse.ArgumentParser) 
             base_images=overrides,
             partitions=tuple(args.ota_partition) if args.ota_partition else None,
             files=tuple(args.ota_file) if args.ota_file else None,
-            jobs=args.ota_jobs or args.threads or 4,
+            jobs=args.ota_jobs or args.threads,
             forced_type=args.ota_format,
             verify=not args.ota_no_verify,
             resume=args.resume,

@@ -167,6 +167,9 @@ def write_data_or_holes(output: io.BufferedWriter, data: bytes, block_size: int)
         return
 
     zero_block = bytes(block_size)
+    if len(data) % block_size == 0 and data[0] and data[-1] and data.find(zero_block) < 0:
+        output.write(data)
+        return
     view = memoryview(data)
     run_start = 0
     run_is_zero = data.startswith(zero_block, 0, block_size)

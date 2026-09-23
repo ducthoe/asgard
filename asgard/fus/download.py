@@ -27,21 +27,21 @@ from ..core.constants import (
     _RESUME_META_SAVE_INTERVAL_S,
     _RETRY_BACKOFF_S,
 )
-from ..core.errors import FUSError, RetryableDownloadError
+from ..core.errors import FUSError, RateLimitedError, RetryableDownloadError
+from ..core.resources import download_worker_count
 from .client import FUSClient
 from .crypto import _decryption_key_from_info, _pkcs7_unpad, decrypted_output_path
 from .firmware import _resolve_versioned_info, initialize_download
 from .models import DownloadResult
 from .protocol import _device_codes
 from .resume import (
-    _DOWNLOAD_THREADS,
     _partial_output_path,
     _prepare_range_resume_state,
     _resume_done_bytes,
     _resume_state_path,
     _save_range_resume_state,
 )
-from .scheduling import split_download_ranges
+from .scheduling import AdaptiveDownloadGate, split_download_ranges
 from .streaming import BandwidthLimiter, _validate_content_range
 
 
@@ -104,7 +104,7 @@ def _download_ranges_parallel(
 ) -> None:
     if workers is not None and workers <= 0:
         raise ValueError("threads must be positive")
-    workers = _DOWNLOAD_THREADS if workers is None else workers
+    workers = download_worker_count(total_size) if workers is None else workers
     ranges[:] = split_download_ranges(ranges, workers=workers)
     state_lock = threading.Lock()
     stop_event = threading.Event()
@@ -118,6 +118,7 @@ def _download_ranges_parallel(
     worker_finished = threading.Event()
     pending_ranges = deque(idx for idx, item in enumerate(ranges) if item["offset"] <= item["end"])
     worker_limit = min(workers, len(pending_ranges))
+    gate = AdaptiveDownloadGate(worker_limit) if worker_limit else None
     chunk_size = _DOWNLOAD_CHUNK_SIZE
     if rate_limiter is not None and rate_limiter.rate > 0:
         chunk_size = min(chunk_size, max(_AES_BLOCK_SIZE, int(rate_limiter.rate * _PROGRESS_REFRESH_S)))
@@ -141,7 +142,10 @@ def _download_ranges_parallel(
                         with state_lock:
                             errors.append(FUSError(f"range {range_idx + 1} ended with a partial encrypted block"))
                     return
+                if gate is None or not gate.acquire(stop_event):
+                    return
                 response: requests.Response | None = None
+                retry_error: Exception | None = None
                 try:
                     response = client.download_file(remote_path, start=request_start, end=seg_end)
                     _validate_content_range(
@@ -150,6 +154,7 @@ def _download_ranges_parallel(
                         end=seg_end,
                         total_size=total_size,
                     )
+                    gate.accepted()
                     expected_response_size = seg_end - request_start + 1
                     response_received = 0
                     fh.seek(write_offset)
@@ -199,34 +204,45 @@ def _download_ranges_parallel(
                             f"range {range_idx + 1} incomplete: expected {seg_end + 1}, got {write_offset}"
                         )
                     return
+                except RateLimitedError as exc:
+                    gate.throttled(exc.retry_after_s)
+                    retry_error = exc
                 except (requests.RequestException, OSError, RetryableDownloadError) as exc:
-                    attempts += 1
-                    if attempts > _DOWNLOAD_RETRIES:
-                        stop_event.set()
-                        with state_lock:
-                            errors.append(FUSError(f"range {range_idx + 1} failed after retries: {exc}"))
-                        return
-                    if recover_download is not None and attempts % _DOWNLOAD_RECOVERY_INTERVAL == 0:
-                        try:
-                            with recovery_lock:
-                                recover_download()
-                        except Exception as recovery_exc:
-                            stop_event.set()
-                            with state_lock:
-                                errors.append(FUSError(f"download recovery failed: {recovery_exc}"))
-                            return
-                        if stop_event.wait(_RATE_LIMIT_COOLDOWN_S):
-                            return
-                    if stop_event.wait(_RETRY_BACKOFF_S * attempts):
-                        return
+                    retry_error = exc
                 except Exception as exc:
                     stop_event.set()
                     with state_lock:
                         errors.append(exc)
                     return
                 finally:
-                    if response is not None:
-                        response.close()
+                    try:
+                        if response is not None:
+                            response.close()
+                    finally:
+                        gate.release()
+                if retry_error is None:
+                    continue
+                attempts += 1
+                if attempts > _DOWNLOAD_RETRIES:
+                    stop_event.set()
+                    with state_lock:
+                        errors.append(FUSError(f"range {range_idx + 1} failed after retries: {retry_error}"))
+                    return
+                if isinstance(retry_error, RateLimitedError):
+                    continue
+                if recover_download is not None and attempts % _DOWNLOAD_RECOVERY_INTERVAL == 0:
+                    try:
+                        with recovery_lock:
+                            recover_download()
+                    except Exception as recovery_exc:
+                        stop_event.set()
+                        with state_lock:
+                            errors.append(FUSError(f"download recovery failed: {recovery_exc}"))
+                        return
+                    if stop_event.wait(_RATE_LIMIT_COOLDOWN_S):
+                        return
+                if stop_event.wait(_RETRY_BACKOFF_S * attempts):
+                    return
 
     def run_worker() -> None:
         try:
@@ -316,14 +332,16 @@ def download_firmware(
 ) -> DownloadResult:
     model_u, region_u = _device_codes(model, region)
 
-    worker_count = _DOWNLOAD_THREADS if threads is None else int(threads)
-    if worker_count <= 0:
+    worker_count = int(threads) if threads is not None else None
+    if worker_count is not None and worker_count <= 0:
         raise ValueError("threads must be positive")
     client = FUSClient(timeout_s=timeout_s)
     info = _resolve_versioned_info(client, model_u, region_u, firmware_version)
     firmware = info.binary_version or ""
     if not firmware:
         raise FUSError("FUS did not return a firmware version")
+    if worker_count is None:
+        worker_count = download_worker_count(info.size)
 
     final_path = _download_output_path(
         filename=info.filename,
@@ -350,6 +368,7 @@ def download_firmware(
     done_before = _resume_done_bytes(ranges)
 
     initialize_download(client, info, region_u)
+    client.configure_download_pool(worker_count)
     remote_path = f"{info.model_path}{info.filename}"
 
     def recover_download() -> None:
@@ -376,7 +395,7 @@ def download_firmware(
                 ranges=ranges,
                 recover_download=recover_download,
                 rate_limiter=limiter,
-                workers=worker_count if threads is not None else None,
+                workers=worker_count,
             )
         meta_path.unlink(missing_ok=True)
         return DownloadResult(temp_path, None, firmware, info.filename, info.size)
@@ -393,7 +412,7 @@ def download_firmware(
                 decrypt_key=decrypt_key,
                 recover_download=recover_download,
                 rate_limiter=limiter,
-                workers=worker_count if threads is not None else None,
+                workers=worker_count,
                 network_progress=progress.add_download,
             )
     meta_path.unlink(missing_ok=True)

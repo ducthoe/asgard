@@ -10,13 +10,15 @@ import lzma
 import os
 import struct
 import zipfile
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
 from ...cli.progress import print_info
 from ...core.errors import FUSError
+from ...core.resources import ota_operation_max_bytes, ota_worker_count
 from ..inplace import prepare_image, write_all, zero_range
 from ..models import OtaPartition
 from ..patch import apply_bsdiff, normalize_source_signature
@@ -44,6 +46,8 @@ _OPERATION_NAMES = {
     13: "LZ4DIFF_PUFFDIFF",
 }
 _SUPPORTED_OPERATIONS = {0, 1, 4, 5, 6, 7, 8, 10}
+_PREADV = getattr(os, "preadv", None)
+_EXTENT_IO_SIZE = 16 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -398,47 +402,128 @@ def _extent_size(extents: tuple[_Extent, ...], block_size: int) -> int:
     return sum(extent.blocks for extent in extents) * block_size
 
 
-def _read_extents(path: Path, extents: tuple[_Extent, ...], block_size: int) -> bytes:
+def _read_extents(file_descriptor: int, extents: tuple[_Extent, ...], block_size: int) -> bytearray:
     total = _extent_size(extents, block_size)
     output = bytearray(total)
+    view = memoryview(output)
     position = 0
-    file_descriptor = os.open(path, os.O_RDONLY)
-    try:
-        for extent in extents:
-            size = extent.blocks * block_size
-            if extent.start != _SPARSE_HOLE:
-                output[position : position + size] = _pread_exact(file_descriptor, size, extent.start * block_size)
+    for extent in extents:
+        size = extent.blocks * block_size
+        if extent.start != _SPARSE_HOLE:
+            source_offset = extent.start * block_size
+            end = position + size
+            while position < end:
+                target = view[position : min(end, position + _EXTENT_IO_SIZE)]
+                if _PREADV is not None:
+                    received = _PREADV(file_descriptor, [target], source_offset)
+                else:
+                    chunk = os.pread(file_descriptor, len(target), source_offset)
+                    received = len(chunk)
+                    target[:received] = chunk
+                if not received:
+                    raise FUSError("unexpected end of OTA payload")
+                position += received
+                source_offset += received
+        else:
             position += size
-    finally:
-        os.close(file_descriptor)
-    return bytes(output)
+    return output
 
 
-def _write_extents(output, extents: tuple[_Extent, ...], block_size: int, data: bytes) -> None:
+def _write_extents(output, extents: tuple[_Extent, ...], block_size: int, data: bytes | bytearray) -> None:
     capacity = _extent_size(extents, block_size)
     if len(data) > capacity:
         raise FUSError(f"operation output exceeds its target extents: {len(data)} > {capacity}")
     position = 0
+    view = memoryview(data)
     for extent in extents:
         size = min(extent.blocks * block_size, len(data) - position)
         if size <= 0:
             break
         if extent.start != _SPARSE_HOLE:
             output.seek(extent.start * block_size)
-            write_all(output, data[position : position + size])
+            write_all(output, view[position : position + size])
         position += size
+
+
+def _pwrite_extents(
+    file_descriptor: int, extents: tuple[_Extent, ...], block_size: int, data: bytes | bytearray
+) -> None:
+    capacity = _extent_size(extents, block_size)
+    if len(data) != capacity:
+        raise FUSError(f"operation output size mismatch: expected {capacity}, got {len(data)}")
+    position = 0
+    view = memoryview(data)
+    for extent in extents:
+        size = extent.blocks * block_size
+        if extent.start != _SPARSE_HOLE:
+            offset = extent.start * block_size
+            end = position + size
+            while position < end:
+                written = os.pwrite(file_descriptor, view[position:end], offset)
+                if written <= 0:
+                    raise FUSError("could not write OTA image data")
+                position += written
+                offset += written
+        else:
+            position += size
+
+
+def _operation_target(
+    payload: PayloadArchive,
+    partition: _Partition,
+    operation: _Operation,
+    index: int,
+    source: bytes | bytearray,
+    *,
+    block_size: int,
+    verify: bool,
+) -> tuple[bytes | bytearray | None, bool]:
+    blob = payload.read_blob(operation) if operation.data_length else b""
+    if verify and operation.data_digest and hashlib.sha256(blob).digest() != operation.data_digest:
+        raise FUSError(f"payload data hash mismatch for {partition.name}")
+    normalized_source = False
+    if operation.source_extents and operation.source_digest and (
+        not verify or hashlib.sha256(source).digest() != operation.source_digest
+    ):
+        position = 0
+        for extent in operation.source_extents:
+            if extent.start == 0:
+                normalized = normalize_source_signature(source, operation.source_digest, offset=position)
+                normalized_source = normalized is not source
+                source = normalized
+                break
+            position += extent.blocks * block_size
+        if verify and not normalized_source:
+            raise FUSError(f"base extent hash mismatch for {partition.name}, operation {index}")
+    if operation.kind == 0:
+        target = blob
+    elif operation.kind == 1:
+        target = bz2.decompress(blob)
+    elif operation.kind == 8:
+        target = lzma.decompress(blob)
+    elif operation.kind in {6, 7}:
+        return None, normalized_source
+    elif operation.kind == 4:
+        target = source
+    else:
+        target = apply_bsdiff(source, blob, expected_size=_extent_size(operation.target_extents, block_size))
+    if len(target) != _extent_size(operation.target_extents, block_size):
+        raise FUSError(f"operation output size mismatch for {partition.name}")
+    return target, normalized_source
 
 
 def _hash_file(path: Path, size: int) -> bytes:
     digest = hashlib.sha256()
     remaining = size
+    buffer = bytearray(min(4 * 1024 * 1024, max(1, size)))
+    view = memoryview(buffer)
     with path.open("rb") as source:
         while remaining:
-            chunk = source.read(min(4 * 1024 * 1024, remaining))
-            if not chunk:
+            received = source.readinto(view[: min(len(view), remaining)])
+            if not received:
                 raise FUSError(f"unexpected end of image: {path}")
-            digest.update(chunk)
-            remaining -= len(chunk)
+            digest.update(view[:received])
+            remaining -= received
     return digest.digest()
 
 
@@ -452,6 +537,8 @@ def _apply_partition(
     resume: bool,
     force: bool,
     consume_source: bool = False,
+    operation_workers: int = 1,
+    operation_limit_bytes: int | None = None,
 ) -> tuple[Path, bool]:
     _validate_partition(partition, payload.manifest.block_size)
     destination = output_dir / f"{partition.name}.img"
@@ -482,11 +569,8 @@ def _apply_partition(
             raise FUSError(f"base image hash mismatch for {partition.name}")
     block_size = payload.manifest.block_size
     in_place = consume_source and needs_source
-    order = (
-        operation_order(partition.operations, block_size)
-        if in_place
-        else ((False, index) for index in range(len(partition.operations)))
-    )
+    if operation_limit_bytes is None:
+        operation_limit_bytes = ota_operation_max_bytes(operation_workers)
     part_path = destination.with_name(f"{destination.name}.part")
     part_path.unlink(missing_ok=True)
     print_info(f"Merging OTA partition: {partition.name}")
@@ -494,70 +578,84 @@ def _apply_partition(
         if in_place:
             prepare_image(source_path, part_path, consume=True)
             source_path = part_path
-        with part_path.open("r+b" if in_place else "x+b", buffering=0) as output:
+        with ExitStack() as stack:
+            output = stack.enter_context(part_path.open("r+b" if in_place else "x+b", buffering=0))
+            source_fd = (
+                stack.enter_context(source_path.open("rb", buffering=0)).fileno() if needs_source else None
+            )
             output.truncate(max(partition.new.size, partition.old.size if in_place else 0))
-            cached: dict[int, bytes] = {}
-            for save, index in order:
-                operation = partition.operations[index]
-                if save:
-                    cached[index] = _read_extents(part_path, operation.source_extents, block_size)
-                    continue
-                blob = payload.read_blob(operation) if operation.data_length else b""
-                if verify and operation.data_digest and hashlib.sha256(blob).digest() != operation.data_digest:
-                    raise FUSError(f"payload data hash mismatch for {partition.name}")
-                source = b""
-                normalized_source = False
-                if operation.source_extents:
-                    if source_path is None:
-                        raise FUSError(f"base image is required for {partition.name}")
-                    saved = cached.pop(index, None)
-                    if saved is not None:
-                        source = saved
-                    else:
-                        source = _read_extents(source_path, operation.source_extents, block_size)
-                    if operation.source_digest and (
-                        not verify or hashlib.sha256(source).digest() != operation.source_digest
-                    ):
-                        position = 0
-                        for extent in operation.source_extents:
-                            if extent.start == 0:
-                                normalized = normalize_source_signature(
-                                    source, operation.source_digest, offset=position
-                                )
-                                normalized_source = normalized is not source
-                                source = normalized
-                                break
-                            position += extent.blocks * block_size
-                        if verify and hashlib.sha256(source).digest() != operation.source_digest:
-                            raise FUSError(f"base extent hash mismatch for {partition.name}, operation {index}")
-                if operation.kind == 0:
-                    target = blob
-                elif operation.kind == 1:
-                    target = bz2.decompress(blob)
-                elif operation.kind == 8:
-                    target = lzma.decompress(blob)
-                elif operation.kind in {6, 7}:
-                    if in_place:
+            if in_place:
+                cached: dict[int, bytearray] = {}
+                for save, index in operation_order(partition.operations, block_size):
+                    operation = partition.operations[index]
+                    if save:
+                        cached[index] = _read_extents(source_fd, operation.source_extents, block_size)
+                        continue
+                    source = b""
+                    if operation.source_extents:
+                        saved = cached.pop(index, None)
+                        source = saved if saved is not None else _read_extents(
+                            source_fd, operation.source_extents, block_size
+                        )
+                    target, normalized_source = _operation_target(
+                        payload, partition, operation, index, source, block_size=block_size, verify=verify
+                    )
+                    if target is None:
                         for extent in operation.target_extents:
                             zero_range(output, extent.start * block_size, extent.blocks * block_size)
-                    continue
-                elif operation.kind == 4:
-                    target = source
-                else:
-                    target = apply_bsdiff(
-                        source,
-                        blob,
-                        expected_size=_extent_size(operation.target_extents, payload.manifest.block_size),
+                    elif not (
+                        not normalized_source
+                        and operation.kind == 4
+                        and operation.source_extents == operation.target_extents
+                    ):
+                        _write_extents(output, operation.target_extents, block_size, target)
+            else:
+                output_fd = output.fileno()
+
+                def apply_independent(index: int) -> None:
+                    operation = partition.operations[index]
+                    source = (
+                        _read_extents(source_fd, operation.source_extents, block_size)
+                        if operation.source_extents
+                        else b""
                     )
-                if len(target) != _extent_size(operation.target_extents, block_size):
-                    raise FUSError(f"operation output size mismatch for {partition.name}")
-                if not (
-                    in_place
-                    and not normalized_source
-                    and operation.kind == 4
-                    and operation.source_extents == operation.target_extents
-                ):
-                    _write_extents(output, operation.target_extents, block_size, target)
+                    target, _normalized = _operation_target(
+                        payload, partition, operation, index, source, block_size=block_size, verify=verify
+                    )
+                    if target is not None:
+                        _pwrite_extents(output_fd, operation.target_extents, block_size, target)
+
+                if operation_workers > 1:
+                    with ThreadPoolExecutor(max_workers=operation_workers) as executor:
+                        pending = deque()
+                        try:
+                            for index, operation in enumerate(partition.operations):
+                                operation_size = (
+                                    operation.data_length
+                                    + _extent_size(operation.source_extents, block_size)
+                                    + _extent_size(operation.target_extents, block_size)
+                                )
+                                parallel = (
+                                    operation.kind in {0, 1, 4, 8}
+                                    and operation_size <= operation_limit_bytes
+                                )
+                                if parallel:
+                                    pending.append(executor.submit(apply_independent, index))
+                                    if len(pending) >= operation_workers * 2:
+                                        pending.popleft().result()
+                                else:
+                                    while pending:
+                                        pending.popleft().result()
+                                    apply_independent(index)
+                            while pending:
+                                pending.popleft().result()
+                        except BaseException:
+                            for future in pending:
+                                future.cancel()
+                            raise
+                else:
+                    for index in range(len(partition.operations)):
+                        apply_independent(index)
             if in_place:
                 end = 0
                 for start, stop in sorted(
@@ -573,10 +671,19 @@ def _apply_partition(
             os.fsync(output.fileno())
         if part_path.stat().st_size != partition.new.size:
             raise FUSError(f"target size mismatch for {partition.name}")
-        if verify and partition.new.digest and _hash_file(part_path, partition.new.size) != partition.new.digest:
-            raise FUSError(f"target hash mismatch for {partition.name}")
+        verified_digest = None
+        if verify and partition.new.digest:
+            verified_digest = _hash_file(part_path, partition.new.size)
+            if verified_digest != partition.new.digest:
+                raise FUSError(f"target hash mismatch for {partition.name}")
         part_path.replace(destination)
-        save_outputs(payload.path, output_dir, (destination,), verify=verify)
+        save_outputs(
+            payload.path,
+            output_dir,
+            (destination,),
+            verify=verify,
+            precomputed_hashes={destination.name: verified_digest.hex()} if verified_digest is not None else None,
+        )
         return destination, False
     except BaseException as exc:
         part_path.unlink(missing_ok=True)
@@ -595,7 +702,7 @@ def apply_payload(
     output_dir: Path,
     *,
     partitions: tuple[str, ...] | None = None,
-    jobs: int = 4,
+    jobs: int | None = None,
     verify: bool = True,
     resume: bool = False,
     force: bool = False,
@@ -612,7 +719,11 @@ def apply_payload(
         for partition in selected:
             _validate_partition(partition, payload.manifest.block_size)
         completed: dict[str, tuple[Path, bool]] = {}
-        with ThreadPoolExecutor(max_workers=min(max(1, jobs), len(selected) or 1)) as executor:
+        worker_budget = ota_worker_count() if jobs is None else max(1, int(jobs))
+        partition_workers = min(worker_budget, len(selected) or 1)
+        operation_workers, extra_workers = divmod(worker_budget, partition_workers)
+        operation_limit_bytes = ota_operation_max_bytes(worker_budget)
+        with ThreadPoolExecutor(max_workers=partition_workers) as executor:
             futures = {
                 executor.submit(
                     _apply_partition,
@@ -624,8 +735,10 @@ def apply_payload(
                     resume=resume,
                     force=force,
                     consume_source=partition.name in consume_base,
+                    operation_workers=operation_workers + (index < extra_workers),
+                    operation_limit_bytes=operation_limit_bytes,
                 ): partition.name
-                for partition in selected
+                for index, partition in enumerate(selected)
             }
             try:
                 for future in as_completed(futures):

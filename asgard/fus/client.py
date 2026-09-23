@@ -6,13 +6,34 @@ from __future__ import annotations
 import threading
 import time
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from math import isfinite
 
 import requests
 
 from ..core.constants import _FUS_BASE_URL, _FUS_DOWNLOAD_URL, _RETRY_BACKOFF_S
-from ..core.errors import FUSError, RetryableDownloadError
+from ..core.errors import FUSError, RateLimitedError, RetryableDownloadError
 from .auth import FUSAuth
 from .protocol import _xml_text
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        pass
+    else:
+        return max(0.0, seconds) if isfinite(seconds) else None
+    try:
+        deadline = parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    return max(0.0, (deadline - datetime.now(timezone.utc)).total_seconds())
 
 
 class FUSClient(FUSAuth):
@@ -24,8 +45,16 @@ class FUSClient(FUSAuth):
     def __init__(self, *, timeout_s: int = 30, session: requests.Session | None = None):
         self.timeout_s = int(timeout_s)
         self.session = session or requests.Session()
+        self._owns_session = session is None
         super().__init__()
         self._refresh_lock = threading.Lock()
+
+    def configure_download_pool(self, workers: int) -> None:
+        if self._owns_session:
+            self.session.mount(
+                _FUS_DOWNLOAD_URL,
+                requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=max(1, workers), pool_block=True),
+            )
 
     def _response_is_401(self, response: requests.Response, body: str) -> bool:
         if response.status_code == 401:
@@ -108,6 +137,11 @@ class FUSClient(FUSAuth):
                 self.refresh_auth()
                 time.sleep(_RETRY_BACKOFF_S)
                 continue
+            if response.status_code in (429, 503):
+                retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
+                status = response.status_code
+                response.close()
+                raise RateLimitedError(f"download server returned HTTP {status}", retry_after_s=retry_after)
             if "Range" in headers and response.status_code != requests.codes.partial_content:
                 status = response.status_code
                 response.close()
