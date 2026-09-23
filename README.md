@@ -165,7 +165,7 @@ directory are handled as well.
 These commands save `./files/system/build.prop` and
 `./files/vendor/build.prop`. You can repeat `--path` for more files, such as
 `--path /vendor/etc/build.prop`. The reader handles EROFS,
-F2FS, and ext4 images, including ordinary LZ4-compressed EROFS files. Some
+F2FS, and ext4 images, including chunked and LZ4-compressed EROFS files. Some
 newer filesystem features, encrypted files, and multi-device images are not
 supported; Asgard reports an error if it encounters one.
 

@@ -1,7 +1,7 @@
 # Copyright (C) 2026 ducthoe
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Read EROFS directories and ordinary flat or LZ4-compressed files."""
+"""Read EROFS directories and flat, chunked, or LZ4-compressed files."""
 
 from __future__ import annotations
 
@@ -189,12 +189,45 @@ class EROFS:
             if position >= offset + length:
                 break
 
+    def _chunked_data(self, inode: _Inode) -> Iterator[bytes]:
+        if not self.incompat & 0x04:
+            raise FUSError("EROFS chunk-based inode has no chunked-file feature")
+        chunk_format = inode.start_block
+        if chunk_format & ~0x3F:
+            raise FUSError("unsupported EROFS chunk format")
+        chunk_size = self.block_size << (chunk_format & 0x1F)
+        entry_size = 8 if chunk_format & 0x20 else 4
+        index_offset = (inode.position + inode.inode_size + inode.xattr_size + entry_size - 1) & -entry_size
+        chunk_count = (inode.size + chunk_size - 1) // chunk_size
+        remaining = inode.size
+        for first in range(0, chunk_count, 4096):
+            batch_size = min(4096, chunk_count - first)
+            entries = self.image.read_at(index_offset + first * entry_size, batch_size * entry_size)
+            for number in range(batch_size):
+                entry = entries[number * entry_size : (number + 1) * entry_size]
+                if entry_size == 8:
+                    device_id = _u16(entry, 2)
+                    if device_id:
+                        raise FUSError("EROFS chunk uses an external device")
+                    block = _u32(entry, 4)
+                else:
+                    block = _u32(entry, 0)
+                length = min(remaining, chunk_size)
+                offset = block * self.block_size
+                while length:
+                    amount = min(length, 1024 * 1024)
+                    yield bytes(amount) if block == 0xFFFFFFFF else self.image.read_at(offset, amount)
+                    offset += amount
+                    remaining -= amount
+                    length -= amount
+
     def _data(self, inode: _Inode) -> Iterator[bytes]:
         if inode.layout in (1, 3):
             yield from self._compressed_data(inode)
             return
         if inode.layout == 4:
-            raise FUSError("EROFS chunk-based files are not supported")
+            yield from self._chunked_data(inode)
+            return
         full, tail = divmod(inode.size, self.block_size)
         for number in range(full):
             yield self.image.read_at((inode.start_block + number) * self.block_size, self.block_size)
