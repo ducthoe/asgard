@@ -152,9 +152,7 @@ def _merge_prepared_ota(
     normalized = {name: Path(path).expanduser().resolve() for name, path in base_images.items()}
     output_names = {part.name: part.output_name for part in plan.partitions}
     _check_existing_outputs(output_dir, expected_names, completed, force=force)
-    target_paths = {
-        (output_dir / (name + suffix)).resolve() for name in expected_names for suffix in ("", ".part")
-    }
+    target_paths = {(output_dir / (name + suffix)).resolve() for name in expected_names for suffix in ("", ".part")}
     if any(path in target_paths for path in normalized.values()):
         raise FUSError("local base images must be separate from OTA output paths")
     prior = tuple(completed.values())

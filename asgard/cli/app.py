@@ -229,6 +229,9 @@ def _build_parser() -> argparse.ArgumentParser:
     content.add_argument("--partition", action="append", metavar="NAME", help="Extract a logical partition; repeatable")
     content.add_argument("--unpack-super", action="store_true", help="Extract every logical super partition")
     download.add_argument(
+        "--path", action="append", metavar="/PARTITION/FILE", help="Download a file by its full device path; repeatable"
+    )
+    download.add_argument(
         "--archive", action="append", metavar="SELECTOR", help="Archive selector; repeatable/globs allowed"
     )
     download.add_argument("--keep-sparse", action="store_true", help="Keep Android sparse images sparse")
@@ -543,6 +546,7 @@ def _handle_download(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                 args.archive,
                 args.keep_sparse,
                 args.decrypt,
+                args.path,
             )
         )
         if incompatible:
@@ -627,6 +631,10 @@ def _handle_download(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         return 0
     if args.keep_sparse and not args.file:
         parser.error("--keep-sparse requires --file")
+    if args.path and (
+        args.file or args.list_entries or args.list_partitions or args.unpack_super or args.keep_sparse or args.decrypt
+    ):
+        parser.error("--path cannot be combined with listing, sparse, super unpacking, or decrypt options")
     if args.list_entries:
         if args.decrypt:
             parser.error("--decrypt cannot be used with --list-entries")
@@ -684,7 +692,27 @@ def _handle_download(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         parser.error("--output is required unless a listing option is used")
     paths: list[Path]
     payload: dict[str, object]
-    if args.file:
+    if args.path:
+        if not args.archive or len(args.archive) != 1:
+            parser.error("--path requires exactly one --archive selector")
+        from ..formats.partition_files import group_partition_paths
+
+        if args.partition and len(args.partition) != 1:
+            parser.error("--partition must match all partitions named in --path")
+        partition = args.partition[0] if args.partition else None
+        try:
+            group_partition_paths(tuple(args.path), partition)
+        except FUSError as exc:
+            parser.error(str(exc))
+        extracted = archive.download_firmware_partition_files(
+            outer_selector=args.archive[0],
+            partition=partition,
+            paths=tuple(args.path),
+            output=args.output,
+            **common,
+        )
+        paths, payload = list(extracted), {"paths": [str(path) for path in extracted]}
+    elif args.file:
         if not args.archive or len(args.archive) != 1:
             parser.error("--file requires exactly one --archive selector")
         if args.decrypt:

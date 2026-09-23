@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import bisect
 import fnmatch
 import hashlib
 import io
@@ -11,15 +12,16 @@ import os
 import secrets
 import struct
 import tarfile
+import time
 import zipfile
 import zlib
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterator, TypeVar
 
 from .. import fus as _fus
-from ..cli.pipeline import PipelineProgress
+from ..cli.pipeline import PipelineProgress, current_pipeline
 from ..cli.progress import format_bytes, print_info
 from ..core.constants import (
     _ARCHIVE_COPY_CHUNK_SIZE,
@@ -37,6 +39,8 @@ from .images import (
     extract_super_partitions,
     list_super_partitions,
 )
+from .partition_files import extract_files, group_partition_paths
+from .random_access import ImageView, PartitionView, ReadableImage, decoded_image
 
 __all__ = [
     "FirmwareArchiveEntry",
@@ -45,6 +49,7 @@ __all__ = [
     "FirmwareTarEntry",
     "download_firmware_entries",
     "download_firmware_super_partitions",
+    "download_firmware_partition_files",
     "download_firmware_tar_member",
     "iter_firmware_super_partitions",
     "iter_firmware_tar_entries",
@@ -55,6 +60,161 @@ _ZIP_LOCAL_FILE_HEADER = struct.Struct("<I5H3I2H")
 _ZIP_LOCAL_FILE_HEADER_SIGNATURE = 0x04034B50
 _GZIP_HEADER = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff"
 _T = TypeVar("_T")
+
+
+class _ImageStream(io.RawIOBase):
+    """Seekable TAR input backed by a bounded remote archive entry."""
+
+    def __init__(self, view: ImageView):
+        super().__init__()
+        self.view = view
+        self.position = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self.position
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_CUR:
+            offset += self.position
+        elif whence == io.SEEK_END:
+            offset += self.view.size
+        elif whence != io.SEEK_SET:
+            raise ValueError("invalid seek mode")
+        if offset < 0:
+            raise ValueError("negative seek")
+        self.position = offset
+        return offset
+
+    def read(self, size: int = -1) -> bytes:
+        amount = self.view.size - self.position
+        if size is not None and size >= 0:
+            amount = min(amount, size)
+        if amount <= 0:
+            return b""
+        data = self.view.read_at(self.position, amount)
+        self.position += len(data)
+        return data
+
+
+class _DeflateArchiveReader(io.RawIOBase):
+    """Forward ZIP DEFLATE decoder with small in-memory seek checkpoints."""
+
+    _INPUT_CHUNK = 32 * 1024
+    _CHECKPOINT_SPACING = 4 * 1024 * 1024
+
+    def __init__(
+        self,
+        source: io.BufferedIOBase,
+        *,
+        data_offset: int,
+        compressed_size: int,
+        uncompressed_size: int,
+    ):
+        super().__init__()
+        self.source = source
+        self.data_offset = data_offset
+        self.compressed_size = compressed_size
+        self.size = uncompressed_size
+        self.position = 0
+        self._compressed_position = 0
+        self._produced = 0
+        self._decoder = zlib.decompressobj(-15)
+        self._buffer = b""
+        self._buffer_position = 0
+        self._checkpoints = [(0, 0, self._decoder.copy())]
+        self._checkpoint_offsets = [0]
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self.position
+
+    def _fill(self) -> bool:
+        if self._decoder.eof:
+            return False
+        if self._compressed_position >= self.compressed_size:
+            raise FUSError("truncated DEFLATE firmware archive")
+        source_offset = self.data_offset + self._compressed_position
+        if self.source.tell() != source_offset:
+            self.source.seek(source_offset)
+        amount = min(self._INPUT_CHUNK, self.compressed_size - self._compressed_position)
+        compressed = self.source.read(amount)
+        if not compressed:
+            raise FUSError("truncated compressed firmware archive")
+        self._compressed_position += len(compressed)
+        try:
+            self._buffer = self._decoder.decompress(compressed)
+        except zlib.error as exc:
+            raise FUSError(f"invalid DEFLATE firmware archive: {exc}") from exc
+        self._buffer_position = 0
+        self._produced += len(self._buffer)
+        if self._produced > self.size:
+            raise FUSError("DEFLATE firmware archive exceeds its declared size")
+        if self._produced - self._checkpoint_offsets[-1] >= self._CHECKPOINT_SPACING and not self._decoder.eof:
+            self._checkpoint_offsets.append(self._produced)
+            self._checkpoints.append((self._produced, self._compressed_position, self._decoder.copy()))
+        if self._decoder.eof and self._produced != self.size:
+            raise FUSError("DEFLATE firmware archive ended at the wrong size")
+        return bool(self._buffer) or not self._decoder.eof
+
+    def read(self, size: int = -1) -> bytes:
+        self._checkClosed()
+        if size is None or size < 0:
+            raise ValueError("a bounded DEFLATE read is required")
+        remaining = min(size, self.size - self.position)
+        output = []
+        while remaining:
+            available = len(self._buffer) - self._buffer_position
+            if not available:
+                if not self._fill():
+                    raise FUSError("DEFLATE firmware archive ended before the requested offset")
+                continue
+            amount = min(remaining, available)
+            output.append(self._buffer[self._buffer_position : self._buffer_position + amount])
+            self._buffer_position += amount
+            self.position += amount
+            remaining -= amount
+        return b"".join(output)
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        self._checkClosed()
+        if whence == io.SEEK_CUR:
+            offset += self.position
+        elif whence == io.SEEK_END:
+            offset += self.size
+        elif whence != io.SEEK_SET:
+            raise ValueError("invalid seek mode")
+        if offset < 0 or offset > self.size:
+            raise ValueError("DEFLATE seek outside the archive")
+        if offset == self.position:
+            return offset
+        buffer_start = self._produced - len(self._buffer)
+        if buffer_start <= offset <= self._produced:
+            self._buffer_position = offset - buffer_start
+            self.position = offset
+            return offset
+        checkpoint_index = bisect.bisect_right(self._checkpoint_offsets, offset) - 1
+        checkpoint_position, compressed_position, decoder = self._checkpoints[checkpoint_index]
+        if offset < self.position or checkpoint_position > self.position:
+            self._decoder = decoder.copy()
+            self._compressed_position = compressed_position
+            self._produced = checkpoint_position
+            self._buffer = b""
+            self._buffer_position = 0
+            self.position = checkpoint_position
+        while self.position < offset:
+            self.read(min(1024 * 1024, offset - self.position))
+        return self.position
 
 
 @dataclass(frozen=True)
@@ -965,6 +1125,120 @@ def _super_member_rank(name: str) -> int | None:
     if basename == "super.img":
         return 1
     return None
+
+
+def _partition_member_rank(member: tarfile.TarInfo, partition: str) -> tuple[int, int]:
+    """Prefer an unsuffixed partition, then slot A, then slot B, with LZ4 first."""
+    basename = PurePosixPath(member.name.replace("\\", "/")).name.casefold()
+    stem = basename.removesuffix(".lz4").removesuffix(".img")
+    base = partition.casefold()
+    slot = 0 if stem == base else 1 if stem == f"{base}_a" else 2
+    return slot, 0 if basename.endswith(".lz4") else 1
+
+
+def download_firmware_partition_files(
+    *,
+    model: str,
+    region: str,
+    outer_selector: str,
+    partition: str | None = None,
+    paths: tuple[str, ...],
+    output: str | os.PathLike[str],
+    firmware_version: str | None = None,
+    timeout_s: int = 30,
+    rate_limit: int | None = None,
+) -> tuple[Path, ...]:
+    """Extract named partition files without staging decoded images on disk."""
+    requested = group_partition_paths(paths, partition)
+    with _open_remote_firmware_archive(
+        model=model,
+        region=region,
+        firmware_version=firmware_version,
+        timeout_s=timeout_s,
+        rate_limit=rate_limit,
+    ) as remote:
+        outer = _select_single_firmware_entry(remote.archive.infolist(), outer_selector)
+        print_info(f"model: {remote.model}")
+        print_info(f"region: {remote.region}")
+        print_info(f"firmware: {remote.firmware_version}")
+        print_info(f"archive: {outer.filename}")
+        progress = current_pipeline()
+        scan_started = time.monotonic()
+        if progress is not None:
+            progress.update_decode("Finding partition image", 0, outer.file_size, scan_started)
+        with ExitStack() as stack:
+            if outer.compress_type == zipfile.ZIP_STORED:
+                outer_view = ImageView(remote.reader, _zip_entry_data_offset(remote, outer), outer.file_size)
+            elif outer.compress_type == zipfile.ZIP_DEFLATED:
+                source = stack.enter_context(
+                    _DeflateArchiveReader(
+                        remote.reader,
+                        data_offset=_zip_entry_data_offset(remote, outer),
+                        compressed_size=outer.compress_size,
+                        uncompressed_size=outer.file_size,
+                    )
+                )
+                outer_view = ImageView(source, 0, outer.file_size)
+            else:
+                raise FUSError(f"unsupported ZIP compression for {outer.filename!r}")
+            stream = _ImageStream(outer_view)
+            # Sequential TAR iteration keeps the DEFLATE decoder moving forward.
+            # Random TAR seeks can replay large compressed ranges from FUS.
+            tar_mode = "r|" if outer.compress_type == zipfile.ZIP_DEFLATED else "r:"
+            tar = stack.enter_context(tarfile.open(fileobj=stream, mode=tar_mode))
+            direct: dict[str, list[tarfile.TarInfo]] = {name: [] for name in requested}
+            super_images: list[tarfile.TarInfo] = []
+            image_names = {
+                name: {
+                    f"{candidate}.img{suffix}"
+                    for candidate in (name.casefold(), f"{name.casefold()}_a", f"{name.casefold()}_b")
+                    for suffix in ("", ".lz4")
+                }
+                for name in requested
+            }
+            for member in tar:
+                if not member.isfile() or not member.size:
+                    continue
+                if progress is not None:
+                    progress.update_decode(
+                        "Finding partition image",
+                        min(member.offset_data, outer.file_size),
+                        outer.file_size,
+                        scan_started,
+                    )
+                basename = PurePosixPath(member.name.replace("\\", "/")).name.casefold()
+                for name, candidates in image_names.items():
+                    if basename in candidates:
+                        direct[name].append(member)
+                if _super_member_rank(member.name) is not None:
+                    super_images.append(member)
+                if super_images or all(direct.values()):
+                    break
+            decoded_cache: dict[int, ReadableImage] = {}
+            results: list[Path] = []
+            for name, file_paths in requested.items():
+                candidates = direct[name] or super_images
+                if not candidates:
+                    raise FUSError(f"{name}.img and super.img were not found in {outer.filename}")
+
+                member = min(candidates, key=lambda candidate: _partition_member_rank(candidate, name))
+                decoded = decoded_cache.get(member.offset_data)
+                if decoded is None:
+                    member_view = ImageView(stream, member.offset_data, member.size)
+                    decoded = decoded_image(member_view, member.name)
+                    decoded_cache[member.offset_data] = decoded
+                image = PartitionView(decoded, name) if not direct[name] else decoded
+                print_info(f"image: {member.name}; partition: {name}")
+                extract_started = time.monotonic()
+
+                def report(done: int, total: int) -> None:
+                    if progress is not None:
+                        progress.update_decode(
+                            f"Extracting /{name}", done, total, extract_started, complete=done == total
+                        )
+
+                results.extend(extract_files(image, name, tuple(file_paths), output, on_progress=report))
+            return tuple(results)
 
 
 def _select_cached_super_member(members: tuple[_IndexedTarMember, ...]) -> _IndexedTarMember | None:

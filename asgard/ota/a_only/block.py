@@ -602,7 +602,10 @@ def _apply_partition_patch(
             os.fsync(output.fileno())
         part_path.replace(destination)
         save_outputs(
-            ota_path, output_dir, (destination,), verify=verify,
+            ota_path,
+            output_dir,
+            (destination,),
+            verify=verify,
             precomputed_hashes={destination.name: output_digest},
         )
     except Exception:
@@ -654,7 +657,10 @@ def _copy_direct_entry(
                 raise FUSError(f"OTA entry size mismatch: {entry}")
             part_path.replace(destination)
             save_outputs(
-                ota_path, output_dir, (destination,), verify=verify,
+                ota_path,
+                output_dir,
+                (destination,),
+                verify=verify,
                 precomputed_hashes={destination.name: digest.hexdigest()},
             )
         except Exception:

@@ -482,8 +482,10 @@ def _operation_target(
     if verify and operation.data_digest and hashlib.sha256(blob).digest() != operation.data_digest:
         raise FUSError(f"payload data hash mismatch for {partition.name}")
     normalized_source = False
-    if operation.source_extents and operation.source_digest and (
-        not verify or hashlib.sha256(source).digest() != operation.source_digest
+    if (
+        operation.source_extents
+        and operation.source_digest
+        and (not verify or hashlib.sha256(source).digest() != operation.source_digest)
     ):
         position = 0
         for extent in operation.source_extents:
@@ -580,9 +582,7 @@ def _apply_partition(
             source_path = part_path
         with ExitStack() as stack:
             output = stack.enter_context(part_path.open("r+b" if in_place else "x+b", buffering=0))
-            source_fd = (
-                stack.enter_context(source_path.open("rb", buffering=0)).fileno() if needs_source else None
-            )
+            source_fd = stack.enter_context(source_path.open("rb", buffering=0)).fileno() if needs_source else None
             output.truncate(max(partition.new.size, partition.old.size if in_place else 0))
             if in_place:
                 cached: dict[int, bytearray] = {}
@@ -594,8 +594,10 @@ def _apply_partition(
                     source = b""
                     if operation.source_extents:
                         saved = cached.pop(index, None)
-                        source = saved if saved is not None else _read_extents(
-                            source_fd, operation.source_extents, block_size
+                        source = (
+                            saved
+                            if saved is not None
+                            else _read_extents(source_fd, operation.source_extents, block_size)
                         )
                     target, normalized_source = _operation_target(
                         payload, partition, operation, index, source, block_size=block_size, verify=verify
@@ -635,10 +637,7 @@ def _apply_partition(
                                     + _extent_size(operation.source_extents, block_size)
                                     + _extent_size(operation.target_extents, block_size)
                                 )
-                                parallel = (
-                                    operation.kind in {0, 1, 4, 8}
-                                    and operation_size <= operation_limit_bytes
-                                )
+                                parallel = operation.kind in {0, 1, 4, 8} and operation_size <= operation_limit_bytes
                                 if parallel:
                                     pending.append(executor.submit(apply_independent, index))
                                     if len(pending) >= operation_workers * 2:

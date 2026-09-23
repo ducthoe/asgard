@@ -145,6 +145,41 @@ asgard download SM-S721B EUX \
   --archive AP --unpack-super --output ./downloads --resume
 ```
 
+To download only a file inside a partition, give its full device path with
+`--path`. Asgard stops scanning the AP archive when it finds an image that can
+supply the requested partition. It reads filesystem data in memory and writes
+only the requested file to the output directory:
+
+```console
+asgard download SM-A566E SER --archive AP \
+  --path /system/build.prop --output ./files
+asgard download SM-A566E SER --archive AP \
+  --path /vendor/build.prop --output ./files
+```
+
+If the AP TAR is compressed inside the firmware ZIP, finding the image can
+still require downloading earlier compressed archive data. The partition image
+is not saved to disk. System images that keep their files inside a `system/`
+directory are handled as well.
+
+These commands save `./files/system/build.prop` and
+`./files/vendor/build.prop`. You can repeat `--path` for more files, such as
+`--path /vendor/etc/build.prop`. The reader handles EROFS,
+F2FS, and ext4 images, including ordinary LZ4-compressed EROFS files. Some
+newer filesystem features, encrypted files, and multi-device images are not
+supported; Asgard reports an error if it encounters one.
+
+You can also request both files in one download by repeating `--path`:
+
+```console
+asgard download SM-A566E SER --archive AP \
+  --path /system/build.prop --path /vendor/build.prop --output ./files
+```
+
+For A/B firmware, `/system/build.prop` also works when the image is named
+`system_a.img` or the logical partition is `system_a`. Asgard tries the
+unsuffixed partition first, then slot A, then slot B.
+
 For resumed extraction, Asgard keeps the source stream locally so it can
 rebuild decoded output without fetching the same source data again.
 
