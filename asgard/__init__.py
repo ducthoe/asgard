@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-__version__ = "3.5.31"
+__version__ = "3.6.0"
 
 from .core.errors import FUSError
 
