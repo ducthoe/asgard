@@ -14,6 +14,7 @@ from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 from dataclasses import dataclass
+from itertools import chain, pairwise
 from pathlib import Path
 
 from ...cli.progress import print_info
@@ -47,7 +48,7 @@ _OPERATION_NAMES = {
 }
 _SUPPORTED_OPERATIONS = {0, 1, 4, 5, 6, 7, 8, 10}
 _PREADV = getattr(os, "preadv", None)
-_EXTENT_IO_SIZE = 16 * 1024 * 1024
+_EXTENT_IO_SIZE = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -394,7 +395,7 @@ def _validate_partition(partition: _Partition, block_size: int) -> None:
         if op.kind == 4 and _extent_size(op.source_extents, block_size) != _extent_size(op.target_extents, block_size):
             raise FUSError(f"source-copy size mismatch for {partition.name}")
     targets.sort()
-    if any(right[0] < left[1] for left, right in zip(targets, targets[1:])):
+    if any(right[0] < left[1] for left, right in pairwise(targets)):
         raise FUSError(f"overlapping payload target extents for {partition.name}")
 
 
@@ -466,6 +467,122 @@ def _pwrite_extents(
                 offset += written
         else:
             position += size
+
+
+def _source_chunks(file_descriptor: int, extents: tuple[_Extent, ...], block_size: int):
+    for extent in extents:
+        remaining = extent.blocks * block_size
+        offset = extent.start * block_size
+        while remaining:
+            amount = min(remaining, _EXTENT_IO_SIZE)
+            yield bytes(amount) if extent.start == _SPARSE_HOLE else _pread_exact(file_descriptor, amount, offset)
+            remaining -= amount
+            offset += amount
+
+
+def _normalized_chunk(chunk: bytes, position: int, signature_position: int) -> bytes:
+    start = max(0, signature_position - position)
+    end = min(len(chunk), signature_position + 256 - position)
+    if start >= end:
+        return chunk
+    return chunk[:start] + bytes(end - start) + chunk[end:]
+
+
+def _stream_source_copy(
+    source_fd: int,
+    output_fd: int,
+    operation: _Operation,
+    block_size: int,
+    *,
+    verify: bool,
+    partition_name: str,
+    index: int,
+) -> None:
+    if verify and operation.data_digest and hashlib.sha256(b"").digest() != operation.data_digest:
+        raise FUSError(f"payload data hash mismatch for {partition_name}")
+    signature_position = None
+    if operation.source_digest:
+        position = 0
+        for extent in operation.source_extents:
+            if extent.start == 0:
+                signature_position = position
+                break
+            position += extent.blocks * block_size
+
+    normalize = False
+    if operation.source_digest and (verify or signature_position is not None):
+        raw_digest = hashlib.sha256() if verify else None
+        normalized_digest = hashlib.sha256() if signature_position is not None else None
+        signature = bytearray()
+        position = 0
+        for chunk in _source_chunks(source_fd, operation.source_extents, block_size):
+            if raw_digest is not None:
+                raw_digest.update(chunk)
+            if normalized_digest is not None and signature_position is not None:
+                marker_start = max(0, signature_position + 768 - position)
+                marker_end = min(len(chunk), signature_position + 779 - position)
+                if marker_start < marker_end:
+                    signature.extend(chunk[marker_start:marker_end])
+                normalized_digest.update(_normalized_chunk(chunk, position, signature_position))
+            position += len(chunk)
+        if raw_digest is not None and raw_digest.digest() == operation.source_digest:
+            normalize = False
+        elif (
+            normalized_digest is not None
+            and signature == b"SignerVer02"
+            and normalized_digest.digest() == operation.source_digest
+        ):
+            normalize = True
+        elif verify:
+            raise FUSError(f"base extent hash mismatch for {partition_name}, operation {index}")
+
+    target_index = 0
+    target_offset = 0
+    position = 0
+    for chunk in _source_chunks(source_fd, operation.source_extents, block_size):
+        if normalize and signature_position is not None:
+            chunk = _normalized_chunk(chunk, position, signature_position)
+        position += len(chunk)
+        view = memoryview(chunk)
+        while view:
+            extent = operation.target_extents[target_index]
+            extent_size = extent.blocks * block_size
+            amount = min(len(view), extent_size - target_offset)
+            offset = extent.start * block_size + target_offset
+            part = view[:amount]
+            while part:
+                written = os.pwrite(output_fd, part, offset)
+                if written <= 0:
+                    raise FUSError("could not write OTA image data")
+                part = part[written:]
+                offset += written
+            view = view[amount:]
+            target_offset += amount
+            if target_offset == extent_size:
+                target_index += 1
+                target_offset = 0
+
+
+def _can_stream_in_place(operation: _Operation) -> bool:
+    if operation.source_extents == operation.target_extents:
+        return True
+    sources = sorted(
+        (extent.start, extent.start + extent.blocks)
+        for extent in operation.source_extents
+        if extent.start != _SPARSE_HOLE
+    )
+    targets = sorted((extent.start, extent.start + extent.blocks) for extent in operation.target_extents)
+    source_index = target_index = 0
+    while source_index < len(sources) and target_index < len(targets):
+        source_start, source_end = sources[source_index]
+        target_start, target_end = targets[target_index]
+        if source_start < target_end and target_start < source_end:
+            return False
+        if source_end <= target_start:
+            source_index += 1
+        else:
+            target_index += 1
+    return True
 
 
 def _operation_target(
@@ -591,6 +708,17 @@ def _apply_partition(
                     if save:
                         cached[index] = _read_extents(source_fd, operation.source_extents, block_size)
                         continue
+                    if operation.kind == 4 and index not in cached and _can_stream_in_place(operation):
+                        _stream_source_copy(
+                            source_fd,
+                            output.fileno(),
+                            operation,
+                            block_size,
+                            verify=verify,
+                            partition_name=partition.name,
+                            index=index,
+                        )
+                        continue
                     source = b""
                     if operation.source_extents:
                         saved = cached.pop(index, None)
@@ -611,11 +739,23 @@ def _apply_partition(
                         and operation.source_extents == operation.target_extents
                     ):
                         _write_extents(output, operation.target_extents, block_size, target)
+                    del source, target
             else:
                 output_fd = output.fileno()
 
                 def apply_independent(index: int) -> None:
                     operation = partition.operations[index]
+                    if operation.kind == 4:
+                        _stream_source_copy(
+                            source_fd,
+                            output_fd,
+                            operation,
+                            block_size,
+                            verify=verify,
+                            partition_name=partition.name,
+                            index=index,
+                        )
+                        return
                     source = (
                         _read_extents(source_fd, operation.source_extents, block_size)
                         if operation.source_extents
@@ -657,11 +797,14 @@ def _apply_partition(
                         apply_independent(index)
             if in_place:
                 end = 0
-                for start, stop in sorted(
-                    (extent.start * block_size, (extent.start + extent.blocks) * block_size)
-                    for operation in partition.operations
-                    for extent in operation.target_extents
-                ) + [(partition.new.size, partition.new.size)]:
+                for start, stop in chain(
+                    sorted(
+                        (extent.start * block_size, (extent.start + extent.blocks) * block_size)
+                        for operation in partition.operations
+                        for extent in operation.target_extents
+                    ),
+                    ((partition.new.size, partition.new.size),),
+                ):
                     if end < start:
                         zero_range(output, end, start - end)
                     end = stop

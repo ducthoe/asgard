@@ -73,8 +73,7 @@ class _HistoryRow:
 
     def merge(self, fields: dict[str, list[str]], *, natures: set[str], open_date: str) -> None:
         self.natures.update(natures)
-        if open_date > self.open_date:
-            self.open_date = open_date
+        self.open_date = max(self.open_date, open_date)
         for tag, values in fields.items():
             for value in values:
                 _add_history_field(self.fields, tag, value)
@@ -135,7 +134,7 @@ def _history_row_from_fields(fields: dict[str, list[str]]) -> _HistoryRow | None
         index=_first_history_field(frozen_fields, "BINARY_INDEX"),
         sequence=_first_history_field(frozen_fields, "BINARY_SEQUENCE"),
         open_date=_first_history_field(frozen_fields, "BINARY_OPEN_DATE"),
-        natures=set(value for value in frozen_fields.get("BINARY_NATURE", ()) if value),
+        natures={value for value in frozen_fields.get("BINARY_NATURE", ()) if value},
         fields=fields,
     )
 

@@ -12,6 +12,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 
 from ...cli.progress import print_info
@@ -19,7 +20,7 @@ from ...core.errors import FUSError
 from ...core.resources import ota_worker_count
 from ..inplace import prepare_image, write_all, zero_range
 from ..models import OtaFile, OtaPartition
-from ..patch import apply_bsdiff
+from ..patch import apply_bsdiff, apply_bsdiff_to_file
 from ..state import save_outputs
 
 _BLOCK_SIZE = 4096
@@ -29,7 +30,7 @@ _ZIP_LOCAL_HEADER = struct.Struct("<I5H3I2H")
 _ZIP_LOCAL_MAGIC = 0x04034B50
 _TRANSFER_SUFFIX = ".transfer.list"
 _DIRECT_SUFFIXES = (".img", ".bin")
-_PATCH_CALL_RE = re.compile(r'patch_partition\((.*?package_extract_file\("([^"\n]+\.p)"\)\s*\))', re.S)
+_PATCH_CALL_RE = re.compile(r'patch_partition\((.*?package_extract_file\("([^"\n]+\.p)"\)\s*\))', re.DOTALL)
 _PATCH_DESCRIPTOR_RE = re.compile(r":(\d+):([0-9a-fA-F]{40})")
 _PARTITION_NAME_RE = re.compile(r"/by-name/([A-Za-z0-9_-]+)")
 _COMMAND_MIN_TOKENS = {"new": 2, "zero": 2, "erase": 2, "move": 5, "bsdiff": 8, "imgdiff": 8, "stash": 3, "free": 2}
@@ -89,7 +90,7 @@ def _parse_ranges(value: str) -> _Ranges:
     if any(start < 0 or end <= start for start, end in pairs):
         raise FUSError(f"invalid OTA range set: {value}")
     ordered = sorted(pairs)
-    if any(right[0] < left[1] for left, right in zip(ordered, ordered[1:])):
+    if any(right[0] < left[1] for left, right in pairwise(ordered)):
         raise FUSError(f"overlapping OTA range set: {value}")
     return _Ranges(pairs)
 
@@ -160,7 +161,7 @@ def _patch_specs(archive: zipfile.ZipFile) -> tuple[_PatchSpec, ...]:
         script = archive.read("META-INF/com/google/android/updater-script").decode("utf-8", "replace")
     except KeyError:
         if patch_entries:
-            raise FUSError("OTA partition patches require updater-script source and target declarations")
+            raise FUSError("OTA partition patches require updater-script source and target declarations") from None
         return ()
     specs: list[_PatchSpec] = []
     for match in _PATCH_CALL_RE.finditer(script):
@@ -251,10 +252,10 @@ def _read_ranges_into(source, ranges: _Ranges, output: memoryview) -> None:
             position += received
 
 
-def _read_ranges(source, ranges: _Ranges) -> bytes:
+def _read_ranges(source, ranges: _Ranges) -> bytearray:
     output = bytearray(ranges.blocks * _BLOCK_SIZE)
     _read_ranges_into(source, ranges, memoryview(output))
-    return bytes(output)
+    return output
 
 
 def _write_ranges(output, ranges: _Ranges, data: bytes | bytearray) -> None:
@@ -287,7 +288,7 @@ def _zero_ranges(output, ranges: _Ranges) -> None:
         zero_range(output, start * _BLOCK_SIZE, (end - start) * _BLOCK_SIZE)
 
 
-def _place_ranges(target: bytearray, locations: _Ranges, source: bytes) -> None:
+def _place_ranges(target: bytearray, locations: _Ranges, source: bytes | bytearray) -> None:
     if len(source) != locations.blocks * _BLOCK_SIZE:
         raise FUSError("OTA stash location size mismatch")
     if any(end * _BLOCK_SIZE > len(target) for _, end in locations.values):
@@ -344,7 +345,7 @@ def _source_spec(tokens: list[str], digest: str) -> tuple[_Ranges, _SourceSpec]:
     return target, _SourceSpec(digest.lower(), blocks, ranges, locations, tuple(stashes))
 
 
-def _load_source(output, source: _SourceSpec, stashes: dict[str, bytes], *, verify: bool) -> bytearray:
+def _load_source(output, source: _SourceSpec, stashes: dict[str, bytearray], *, verify: bool) -> bytearray:
     result = bytearray(source.blocks * _BLOCK_SIZE)
     if source.ranges.blocks:
         if source.locations is None:
@@ -458,9 +459,8 @@ def _apply_transfer(
     with zipfile.ZipFile(ota_path) as archive:
         _validate_transfer(archive, transfer)
         expected_size = _target_size(archive, transfer, source_path.stat().st_size if source_path else 0)
-    if destination.exists():
-        if not force:
-            raise FUSError(f"OTA output already exists: {destination}")
+    if destination.exists() and not force:
+        raise FUSError(f"OTA output already exists: {destination}")
     if source_path is not None and not source_path.is_file():
         raise FUSError(f"base image is required for {transfer.name}")
     part_path = destination.with_name(f"{destination.name}.part")
@@ -481,7 +481,7 @@ def _apply_transfer(
                 patch_fd, patch_offset = _stored_entry_offset(ota_path, archive.getinfo(patch_entry))
             else:
                 patch_offset = 0
-            stashes: dict[str, bytes] = {}
+            stashes: dict[str, bytearray] = {}
             with part_path.open("r+b") as output:
                 output.truncate(max(output.seek(0, os.SEEK_END), expected_size))
                 for raw_command in transfer.commands:
@@ -509,6 +509,7 @@ def _apply_transfer(
                             raise FUSError(f"OTA move target hash mismatch for {transfer.name}")
                         result = _load_source(output, source, stashes, verify=verify)
                         _write_ranges(output, target, result)
+                        del result
                     else:
                         if patch_fd < 0:
                             raise FUSError(f"patch-data stream is missing for {transfer.name}")
@@ -525,9 +526,9 @@ def _apply_transfer(
                         if verify and hashlib.sha1(result).hexdigest() != tokens[3].lower():
                             raise FUSError(f"OTA patch target hash mismatch for {transfer.name}")
                         _write_ranges(output, target, result)
-                if new_stream is not None:
-                    if new_stream.read(1):
-                        raise FUSError(f"unused new-data bytes for {transfer.name}")
+                        del source_data, patch, result
+                if new_stream is not None and new_stream.read(1):
+                    raise FUSError(f"unused new-data bytes for {transfer.name}")
                 output.truncate(expected_size)
                 output.flush()
                 os.fsync(output.fileno())
@@ -585,19 +586,19 @@ def _apply_partition_patch(
     if verify and _sha1_file(source_path) != spec.source_digest:
         raise FUSError(f"base {spec.name} hash mismatch")
     print_info(f"Merging OTA partition: {spec.name}")
-    with zipfile.ZipFile(ota_path) as archive:
-        patch = archive.read(spec.patch_entry)
-    result = apply_bsdiff(source_path.read_bytes(), patch, expected_size=spec.size)
-    if verify and hashlib.sha1(result).hexdigest() != spec.target_digest:
-        raise FUSError(f"target {spec.name} hash mismatch")
-    output_digest = hashlib.sha256(result).hexdigest()
     part_path = destination.with_name(f"{destination.name}.part")
     part_path.unlink(missing_ok=True)
     try:
-        if consume_source:
-            prepare_image(source_path, part_path, consume=True)
-        with part_path.open("wb") as output:
-            output.write(result)
+        with zipfile.ZipFile(ota_path) as archive, ExitStack() as stack, part_path.open("xb") as output:
+            patch_info = archive.getinfo(spec.patch_entry)
+            control = stack.enter_context(archive.open(patch_info))
+            diff = stack.enter_context(archive.open(patch_info))
+            extra = stack.enter_context(archive.open(patch_info))
+            target_digest, output_digest = apply_bsdiff_to_file(
+                source_path, (control, diff, extra), patch_info.file_size, output, expected_size=spec.size
+            )
+            if verify and target_digest != spec.target_digest:
+                raise FUSError(f"target {spec.name} hash mismatch")
             output.flush()
             os.fsync(output.fileno())
         part_path.replace(destination)
@@ -608,7 +609,9 @@ def _apply_partition_patch(
             verify=verify,
             precomputed_hashes={destination.name: output_digest},
         )
-    except Exception:
+        if consume_source:
+            source_path.unlink()
+    except BaseException:
         part_path.unlink(missing_ok=True)
         raise
     return destination, False

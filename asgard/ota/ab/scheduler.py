@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import heapq
 from bisect import bisect_left
+from itertools import pairwise
 
 from ...core.errors import FUSError
 
@@ -15,7 +16,7 @@ def operation_order(operations, block_size: int):
         for index, operation in enumerate(operations)
         for extent in operation.target_extents
     )
-    if any(right[0] < left[1] for left, right in zip(targets, targets[1:])):
+    if any(right[0] < left[1] for left, right in pairwise(targets)):
         raise FUSError("overlapping payload target extents")
     starts = [start for start, _, _ in targets]
     outgoing = [set() for _ in operations]
@@ -24,7 +25,7 @@ def operation_order(operations, block_size: int):
         for extent in operation.source_extents:
             index = max(0, bisect_left(starts, extent.start) - 1)
             while index < len(targets) and targets[index][0] < extent.start + extent.blocks:
-                start, end, writer = targets[index]
+                _, end, writer = targets[index]
                 if end > extent.start and writer != reader and writer not in outgoing[reader]:
                     outgoing[reader].add(writer)
                     incoming[writer] += 1

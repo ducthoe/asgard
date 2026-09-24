@@ -8,9 +8,9 @@ import os
 import queue
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import copy_context
-from typing import Iterator
 
 from ..cli.progress import render_progress
 from .constants import _ARCHIVE_COPY_CHUNK_SIZE, _PROGRESS_REFRESH_S

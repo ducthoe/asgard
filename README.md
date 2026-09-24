@@ -220,12 +220,12 @@ Asgard writes downloaded base images into the merge output. Add
 reuse finished outputs, but an interrupted patch starts again from its base
 image. Asgard does not build an Odin package or flash a device.
 
-OTA work uses a CPU-based worker count by default. If `psutil` is installed,
-available memory also limits the count. Use `--ota-jobs N` to choose a limit
-yourself. OTA patching can use substantial RAM, especially with several
-partitions at once; choose fewer targets or lower `--ota-jobs` if memory is
-tight. Asgard streams compressed firmware packages and super images without
-staging them to disk.
+OTA work uses one worker when available memory cannot be measured. Otherwise,
+the default scales with available CPUs and memory, allowing roughly 768 MiB
+per worker. Use `--ota-jobs N` to set a limit yourself. Full-image block patches
+and safe A/B source copies stream in bounded chunks; overlapping in-place
+operations may still need source buffers. Asgard streams compressed firmware
+packages and super images without staging them to disk.
 
 Asgard checks patch source data, available target hashes, and ZIP contents.
 `--ota-force` lets you replace existing outputs or override the declared base

@@ -13,8 +13,8 @@ from .models import OtaMetadata
 _METADATA_PATH = "META-INF/com/android/metadata"
 _SOURCE_AP_RE = re.compile(r"^AP_([^_]+)_")
 _SOURCE_CSC_RE = re.compile(r"^(?:HOME_)?CSC_[^_]+_([^_]+)_")
-_UI_PRINT_RE = re.compile(r'\bui_print\s*\(\s*"((?:[^"\\]|\\.)*)"\s*\)', re.S)
-_SOURCE_QB_RE = re.compile(r"^\s*(?:\[[^\]\n]*\]\s*)?source binary QB info\b", re.I)
+_UI_PRINT_RE = re.compile(r'\bui_print\s*\(\s*"((?:[^"\\]|\\.)*)"\s*\)', re.DOTALL)
+_SOURCE_QB_RE = re.compile(r"^\s*(?:\[[^\]\n]*\]\s*)?source binary QB info\b", re.IGNORECASE)
 
 
 def source_archive_hints(metadata: OtaMetadata) -> tuple[str, ...]:
@@ -32,7 +32,9 @@ def source_archive_hints(metadata: OtaMetadata) -> tuple[str, ...]:
         message = match[1].replace("\\n", "\n")
         if _SOURCE_QB_RE.match(message):
             names.extend(line.strip() for line in message.splitlines()[1:])
-    return tuple(dict.fromkeys(name for name in names if re.fullmatch(r"[^\s/\\\x00]+\.tar(?:\.md5)?", name, re.I)))
+    return tuple(
+        dict.fromkeys(name for name in names if re.fullmatch(r"[^\s/\\\x00]+\.tar(?:\.md5)?", name, re.IGNORECASE))
+    )
 
 
 def _read_properties(raw: bytes) -> dict[str, str]:

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 
 
@@ -42,7 +43,5 @@ def save_locations(path: Path | None, identity: str, locations: dict[str, str]) 
         pass
     finally:
         if temporary is not None:
-            try:
+            with suppress(OSError):
                 Path(temporary).unlink(missing_ok=True)
-            except OSError:
-                pass

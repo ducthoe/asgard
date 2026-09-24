@@ -15,10 +15,11 @@ import tarfile
 import time
 import zipfile
 import zlib
-from contextlib import ExitStack, contextmanager, suppress
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, closing, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Callable, Iterator, TypeVar
+from typing import TypeVar
 
 from .. import fus as _fus
 from ..cli.pipeline import PipelineProgress, current_pipeline
@@ -48,8 +49,8 @@ __all__ = [
     "FirmwareSuperPartition",
     "FirmwareTarEntry",
     "download_firmware_entries",
-    "download_firmware_super_partitions",
     "download_firmware_partition_files",
+    "download_firmware_super_partitions",
     "download_firmware_tar_member",
     "iter_firmware_super_partitions",
     "iter_firmware_tar_entries",
@@ -282,16 +283,18 @@ def _open_remote_firmware_archive(
     timeout_s: int = 30,
     rate_limit: int | None = None,
 ) -> Iterator[_RemoteFirmwareArchive]:
-    with PipelineProgress() as progress:
-        with _remote_firmware_archive(
+    with (
+        PipelineProgress() as progress,
+        _remote_firmware_archive(
             model=model,
             region=region,
             firmware_version=firmware_version,
             timeout_s=timeout_s,
             rate_limit=rate_limit,
             network_progress=progress.add_download,
-        ) as remote:
-            yield remote
+        ) as remote,
+    ):
+        yield remote
 
 
 @contextmanager
@@ -739,13 +742,17 @@ def _open_indexed_firmware_entry(
         crc=outer_entry.CRC,
         uncompressed_size=outer_entry.file_size,
     )
-    indexed_source = indexed_gzip.IndexedGzipFile(
-        fileobj=virtual_source,
-        spacing=_TAR_INDEX_SPACING,
-        readbuf_size=_ARCHIVE_COPY_CHUNK_SIZE,
-        readall_buf_size=_ARCHIVE_COPY_CHUNK_SIZE,
-        buffer_size=buffer_size or _TAR_INDEX_SCAN_BUFFER_SIZE,
-    )
+    try:
+        indexed_source = indexed_gzip.IndexedGzipFile(
+            fileobj=virtual_source,
+            spacing=_TAR_INDEX_SPACING,
+            readbuf_size=_ARCHIVE_COPY_CHUNK_SIZE,
+            readall_buf_size=_ARCHIVE_COPY_CHUNK_SIZE,
+            buffer_size=buffer_size or _TAR_INDEX_SCAN_BUFFER_SIZE,
+        )
+    except BaseException:
+        virtual_source.close()
+        raise
     try:
         if index_path is not None:
             try:
@@ -755,8 +762,10 @@ def _open_indexed_firmware_entry(
                 raise StreamSourceError from exc
         yield indexed_source
     finally:
-        indexed_source.close()
-        virtual_source.close()
+        try:
+            indexed_source.close()
+        finally:
+            virtual_source.close()
 
 
 @contextmanager
@@ -810,10 +819,8 @@ def _open_firmware_tar(
             archive = tarfile.open(fileobj=source, mode=mode)
         except tarfile.TarError as exc:
             raise FUSError(f"archive entry {outer_entry.filename!r} is not a readable TAR: {exc}") from exc
-        try:
+        with closing(archive):
             yield archive
-        finally:
-            archive.close()
 
 
 def iter_firmware_tar_entries(
@@ -865,21 +872,21 @@ def iter_firmware_tar_entries(
                                 f"archive entry {outer_entry.filename!r} is not a readable TAR: {exc}"
                             ) from exc
                         try:
-                            for member in archive:
-                                if not member.isfile():
-                                    continue
-                                indexed_member = _IndexedTarMember(
-                                    name=member.name,
-                                    size=member.size,
-                                    offset_data=member.offset_data,
-                                )
-                                indexed_members.append(indexed_member)
-                                yield FirmwareTarEntry(name=member.name, size=member.size)
-                            while indexed_source.read(_ARCHIVE_COPY_CHUNK_SIZE):
-                                pass
-                            scan_complete = True
+                            with closing(archive):
+                                for member in archive:
+                                    if not member.isfile():
+                                        continue
+                                    indexed_member = _IndexedTarMember(
+                                        name=member.name,
+                                        size=member.size,
+                                        offset_data=member.offset_data,
+                                    )
+                                    indexed_members.append(indexed_member)
+                                    yield FirmwareTarEntry(name=member.name, size=member.size)
+                                while indexed_source.read(_ARCHIVE_COPY_CHUNK_SIZE):
+                                    pass
+                                scan_complete = True
                         finally:
-                            archive.close()
                             _save_tar_index(
                                 remote,
                                 outer_entry,
@@ -890,7 +897,7 @@ def iter_firmware_tar_entries(
                     return
                 except StreamSourceError:
                     if cache_attempt is None:
-                        raise FUSError(f"cached TAR index for {outer_entry.filename!r} could not be read")
+                        raise FUSError(f"cached TAR index for {outer_entry.filename!r} could not be read") from None
                     _discard_tar_index(remote, outer_entry)
                     cache_attempt = None
                 except FUSError:
@@ -1231,10 +1238,12 @@ def download_firmware_partition_files(
                 print_info(f"image: {member.name}; partition: {name}")
                 extract_started = time.monotonic()
 
-                def report(done: int, total: int) -> None:
+                def report(
+                    done: int, total: int, partition_name: str = name, started_at: float = extract_started
+                ) -> None:
                     if progress is not None:
                         progress.update_decode(
-                            f"Extracting /{name}", done, total, extract_started, complete=done == total
+                            f"Extracting /{partition_name}", done, total, started_at, complete=done == total
                         )
 
                 results.extend(extract_files(image, name, tuple(file_paths), output, on_progress=report))

@@ -8,7 +8,7 @@ import os
 import re
 import threading
 import time
-from typing import Callable, Iterator
+from collections.abc import Callable, Iterator
 
 import requests
 from Cryptodome.Cipher import AES

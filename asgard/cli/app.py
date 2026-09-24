@@ -571,9 +571,11 @@ def _handle_download(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                 _json_print(payload)
             else:
                 print(f"type: {plan.metadata.ota_type}")
-                print(
-                    f"base: {args.firmware or (plan.metadata.base_ap + '/' + plan.metadata.base_csc + ' (resolved through firmware history when downloading)')}"
+                base = args.firmware or (
+                    f"{plan.metadata.base_ap}/{plan.metadata.base_csc} "
+                    "(resolved through firmware history when downloading)"
                 )
+                print(f"base: {base}")
                 print(f"target: {plan.metadata.post_incremental}")
                 total_size = 0
                 print("partitions:")
@@ -666,7 +668,9 @@ def _handle_download(args: argparse.Namespace, parser: argparse.ArgumentParser) 
             _json_print(payload)
         else:
             print(
-                f"firmware: {listing.firmware_version}\nfilename: {listing.filename}\nsize: {format_bytes(listing.size)}\n"
+                f"firmware: {listing.firmware_version}\n"
+                f"filename: {listing.filename}\n"
+                f"size: {format_bytes(listing.size)}\n"
             )
             print(f"{'Size':>12} {'Compressed':>12}  Name")
             for entry in listing.entries:
@@ -803,7 +807,11 @@ def main(argv: list[str] | None = None) -> int:
                 _json_print(result)
             else:
                 print(
-                    f"valid: {result['path']}\nformat: {result['format']}\nsize: {format_bytes(result['size'])}\nsha256: {result['sha256']}\nmd5: {result['md5']}"
+                    f"valid: {result['path']}\n"
+                    f"format: {result['format']}\n"
+                    f"size: {format_bytes(result['size'])}\n"
+                    f"sha256: {result['sha256']}\n"
+                    f"md5: {result['md5']}"
                 )
                 if result.get("entry_count") is not None:
                     print(f"entries: {result['entry_count']}")

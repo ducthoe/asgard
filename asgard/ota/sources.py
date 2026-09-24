@@ -175,9 +175,13 @@ def _download_sources(
 ) -> dict[str, Path]:
     from ..formats import archive
 
-    common = dict(
-        model=model, region=region, firmware_version=firmware_version, timeout_s=timeout_s, rate_limit=rate_limit
-    )
+    common = {
+        "model": model,
+        "region": region,
+        "firmware_version": firmware_version,
+        "timeout_s": timeout_s,
+        "rate_limit": rate_limit,
+    }
     pending = {
         name: {path.name for path in _candidate_paths(Path("."), name, member)}
         for name, member in source_members.items()

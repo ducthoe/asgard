@@ -7,8 +7,8 @@ import os
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import requests
 from Cryptodome.Cipher import AES

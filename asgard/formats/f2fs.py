@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import stat
 import struct
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator
 
 from ..core.errors import FUSError
 from .random_access import ReadableImage

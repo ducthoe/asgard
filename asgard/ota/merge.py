@@ -111,7 +111,8 @@ def _check_existing_outputs(output: Path, names: tuple[str, ...], completed: dic
         for name in names:
             if (output / name).exists() and name not in completed:
                 raise FUSError(
-                    f"OTA output exists without a matching completion record: {output / name}; use --ota-force to replace it"
+                    f"OTA output exists without a matching completion record: {output / name}; "
+                    "use --ota-force to replace it"
                 )
 
 

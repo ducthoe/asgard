@@ -49,9 +49,9 @@ class CachedView:
         self.source = source
         self.size = source.size
         self.page_size = page_size
+        self._page_cache = lru_cache(maxsize=16)(self._read_page)
 
-    @lru_cache(maxsize=16)
-    def _page(self, index: int) -> bytes:
+    def _read_page(self, index: int) -> bytes:
         offset = index * self.page_size
         return self.source.read_at(offset, min(self.page_size, self.size - offset))
 
@@ -64,10 +64,13 @@ class CachedView:
             return self.source.read_at(offset, size)
         if size > self.page_size * 2:
             return self.source.read_at(offset, size)
+        index, inside = divmod(offset, self.page_size)
+        if inside + size <= self.page_size:
+            return self._page_cache(index)[inside : inside + size]
         chunks = []
         while size:
             index, inside = divmod(offset, self.page_size)
-            part = self._page(index)[inside : inside + size]
+            part = self._page_cache(index)[inside : inside + size]
             chunks.append(part)
             offset += len(part)
             size -= len(part)
@@ -124,6 +127,7 @@ class LZ4View:
         else:
             raise FUSError("unsupported LZ4 image frame")
         self._checkpoint_stride = max(1, (16 * 1024 * 1024) // self._block_size)
+        self._decoded_cache = lru_cache(maxsize=4)(self._decode_block)
 
     @property
     def size(self) -> int | None:
@@ -166,8 +170,7 @@ class LZ4View:
         if self._finished and self._size is not None and self._size > self._logical:
             raise FUSError("LZ4 image ended before its declared size")
 
-    @lru_cache(maxsize=4)
-    def _decoded(self, index: int) -> bytes:
+    def _decode_block(self, index: int) -> bytes:
         if self._linked:
             if index == self._last_decoded_index:
                 return self._last_decoded
@@ -211,7 +214,7 @@ class LZ4View:
             if index < 0:
                 raise FUSError("invalid LZ4 image offset")
             inside = offset - self._starts[index]
-            part = self._decoded(index)[inside : inside + size]
+            part = self._decoded_cache(index)[inside : inside + size]
             if not part:
                 raise FUSError("truncated LZ4 image block")
             chunks.append(part)
@@ -268,7 +271,9 @@ class SparseView:
             if kind == 0xCAC1:
                 output.append(self.source.read_at(data_position + inside, count))
             else:
-                output.append((pattern * ((inside + count + 3) // 4))[inside : inside + count])
+                phase = inside % len(pattern)
+                rotated = pattern[phase:] + pattern[:phase]
+                output.append((rotated * ((count + len(pattern) - 1) // len(pattern)))[:count])
             offset += count
             size -= count
         return b"".join(output)

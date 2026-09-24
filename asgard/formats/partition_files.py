@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
-from typing import Callable
 
 from ..core.errors import FUSError
 from .erofs import EROFS
