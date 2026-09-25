@@ -78,12 +78,14 @@ class HelpParser(argparse.ArgumentParser):
         *args: object,
         command_groups: CommandGroups | None = None,
         examples: Examples = (),
+        example_count: int | None = None,
         **kwargs: object,
     ):
         kwargs.setdefault("formatter_class", CompactHelpFormatter)
         super().__init__(*args, **kwargs)
         self.command_groups = command_groups
         self.examples = examples
+        self.example_count = example_count
 
     def format_help(self) -> str:
         if self.command_groups is None:
@@ -110,8 +112,8 @@ class HelpParser(argparse.ArgumentParser):
 
         if self.examples:
             lines = [content.rstrip(), "", "Examples:"]
-            examples = list(self.examples)
-            random.shuffle(examples)
+            count = len(self.examples) if self.example_count is None else min(self.example_count, len(self.examples))
+            examples = random.sample(self.examples, k=count)
             for label, command in examples:
                 lines.append(f"  {label}:")
                 lines.extend(

@@ -50,15 +50,34 @@ _COMMAND_GROUPS = (
 )
 _COMMAND_HELP = {name: description for _group, commands in _COMMAND_GROUPS for name, description in commands}
 _ROOT_EXAMPLES = (
+    ("Check the latest release", "asgard checkupdate MODEL CSC"),
+    ("Browse release history", "asgard history MODEL CSC"),
+    ("Compare two CSCs", "asgard compare MODEL CSC_A CSC_B"),
+    ("Download an encrypted package", "asgard download MODEL CSC -o DIR"),
     ("Download and decrypt", "asgard download MODEL CSC --decrypt --resume -o DIR"),
+    ("List archive files", "asgard download MODEL CSC --archive AP --list-entries"),
     ("Read a partition file", "asgard download MODEL CSC --archive AP --path /system/build.prop -o DIR"),
+    ("List OTA targets", "asgard download MODEL CSC --ota update.zip --ota-list-targets"),
     ("Apply an OTA", "asgard download MODEL CSC --ota update.zip -o DIR"),
+    ("Inspect an OTA", "asgard ota-info update.zip"),
+    ("Verify a package", "asgard verify firmware.zip"),
+    ("Create a manifest", "asgard manifest firmware.zip -o firmware.json"),
+    ("Preview batch jobs", "asgard batch firmware.toml --dry-run"),
+    ("Save a device profile", "asgard profile add phone MODEL CSC"),
 )
 _DOWNLOAD_EXAMPLES = (
-    ("Whole firmware", "asgard download MODEL CSC --decrypt --resume -o DIR"),
-    ("One archive file", "asgard download MODEL CSC --archive AP --file boot.img.lz4 -o DIR"),
-    ("Logical partition", "asgard download MODEL CSC --archive AP --partition system -o DIR"),
-    ("File inside a partition", "asgard download MODEL CSC --archive AP --path /system/build.prop -o DIR"),
+    ("Encrypted package", "asgard download MODEL CSC -o DIR"),
+    ("Decrypt while downloading", "asgard download MODEL CSC --decrypt --resume -o DIR"),
+    ("List package archives", "asgard download MODEL CSC --list-entries"),
+    ("List files in AP", "asgard download MODEL CSC --archive AP --list-entries"),
+    ("Download one archive", "asgard download MODEL CSC --archive BL -o DIR"),
+    ("Extract one file", "asgard download MODEL CSC --archive AP --file boot.img.lz4 -o DIR"),
+    ("List logical partitions", "asgard download MODEL CSC --archive AP --list-partitions"),
+    ("Extract a partition", "asgard download MODEL CSC --archive AP --partition system -o DIR"),
+    ("Unpack all partitions", "asgard download MODEL CSC --archive AP --unpack-super -o DIR"),
+    ("Read a partition file", "asgard download MODEL CSC --archive AP --path /system/build.prop -o DIR"),
+    ("List OTA targets", "asgard download MODEL CSC --ota update.zip --ota-list-targets"),
+    ("Merge one OTA partition", "asgard download MODEL CSC --ota update.zip --ota-partition system -o DIR"),
     ("Apply an OTA", "asgard download MODEL CSC --ota update.zip -o DIR"),
 )
 _HISTORY_DETAIL_SKIP_TAGS = {
@@ -247,7 +266,11 @@ def _result_dict(result: fus.DownloadResult) -> dict[str, object]:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = HelpParser(
-        prog="asgard", description=f"asgard {__version__}", command_groups=_COMMAND_GROUPS, examples=_ROOT_EXAMPLES
+        prog="asgard",
+        description=f"asgard {__version__}",
+        command_groups=_COMMAND_GROUPS,
+        examples=_ROOT_EXAMPLES,
+        example_count=4,
     )
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
@@ -269,6 +292,7 @@ def _build_parser() -> argparse.ArgumentParser:
         usage="%(prog)s [options] model [region]",
         description="Download a package, extract a TAR member or partition, read files inside a partition, or merge an OTA.",
         examples=_DOWNLOAD_EXAMPLES,
+        example_count=4,
     )
     _add_device_args(download)
     source = download.add_argument_group("Firmware source")
