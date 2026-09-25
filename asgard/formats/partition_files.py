@@ -1,8 +1,6 @@
 # Copyright (C) 2026 ducthoe
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Extract selected files from a decoded partition, writing only the results."""
-
 from __future__ import annotations
 
 import os

@@ -1,8 +1,6 @@
 # Copyright (C) 2026 ducthoe
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Read ordinary ext4 files through a bounded random-access image view."""
-
 from __future__ import annotations
 
 import stat

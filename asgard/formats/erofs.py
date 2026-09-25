@@ -1,8 +1,6 @@
 # Copyright (C) 2026 ducthoe
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Read EROFS directories and flat, chunked, or LZ4-compressed files."""
-
 from __future__ import annotations
 
 import stat

@@ -1,8 +1,6 @@
 # Copyright (C) 2026 ducthoe
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Small, seekable views over firmware images. No decoded image is staged on disk."""
-
 from __future__ import annotations
 
 import bisect

@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import bisect
 import fnmatch
 import hashlib
 import io
@@ -101,121 +100,6 @@ class _ImageStream(io.RawIOBase):
         data = self.view.read_at(self.position, amount)
         self.position += len(data)
         return data
-
-
-class _DeflateArchiveReader(io.RawIOBase):
-    """Forward ZIP DEFLATE decoder with small in-memory seek checkpoints."""
-
-    _INPUT_CHUNK = 32 * 1024
-    _CHECKPOINT_SPACING = 4 * 1024 * 1024
-
-    def __init__(
-        self,
-        source: io.BufferedIOBase,
-        *,
-        data_offset: int,
-        compressed_size: int,
-        uncompressed_size: int,
-    ):
-        super().__init__()
-        self.source = source
-        self.data_offset = data_offset
-        self.compressed_size = compressed_size
-        self.size = uncompressed_size
-        self.position = 0
-        self._compressed_position = 0
-        self._produced = 0
-        self._decoder = zlib.decompressobj(-15)
-        self._buffer = b""
-        self._buffer_position = 0
-        self._checkpoints = [(0, 0, self._decoder.copy())]
-        self._checkpoint_offsets = [0]
-
-    def readable(self) -> bool:
-        return True
-
-    def seekable(self) -> bool:
-        return True
-
-    def tell(self) -> int:
-        return self.position
-
-    def _fill(self) -> bool:
-        if self._decoder.eof:
-            return False
-        if self._compressed_position >= self.compressed_size:
-            raise FUSError("truncated DEFLATE firmware archive")
-        source_offset = self.data_offset + self._compressed_position
-        if self.source.tell() != source_offset:
-            self.source.seek(source_offset)
-        amount = min(self._INPUT_CHUNK, self.compressed_size - self._compressed_position)
-        compressed = self.source.read(amount)
-        if not compressed:
-            raise FUSError("truncated compressed firmware archive")
-        self._compressed_position += len(compressed)
-        try:
-            self._buffer = self._decoder.decompress(compressed)
-        except zlib.error as exc:
-            raise FUSError(f"invalid DEFLATE firmware archive: {exc}") from exc
-        self._buffer_position = 0
-        self._produced += len(self._buffer)
-        if self._produced > self.size:
-            raise FUSError("DEFLATE firmware archive exceeds its declared size")
-        if self._produced - self._checkpoint_offsets[-1] >= self._CHECKPOINT_SPACING and not self._decoder.eof:
-            self._checkpoint_offsets.append(self._produced)
-            self._checkpoints.append((self._produced, self._compressed_position, self._decoder.copy()))
-        if self._decoder.eof and self._produced != self.size:
-            raise FUSError("DEFLATE firmware archive ended at the wrong size")
-        return bool(self._buffer) or not self._decoder.eof
-
-    def read(self, size: int = -1) -> bytes:
-        self._checkClosed()
-        if size is None or size < 0:
-            raise ValueError("a bounded DEFLATE read is required")
-        remaining = min(size, self.size - self.position)
-        output = []
-        while remaining:
-            available = len(self._buffer) - self._buffer_position
-            if not available:
-                if not self._fill():
-                    raise FUSError("DEFLATE firmware archive ended before the requested offset")
-                continue
-            amount = min(remaining, available)
-            output.append(self._buffer[self._buffer_position : self._buffer_position + amount])
-            self._buffer_position += amount
-            self.position += amount
-            remaining -= amount
-        return b"".join(output)
-
-    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
-        self._checkClosed()
-        if whence == io.SEEK_CUR:
-            offset += self.position
-        elif whence == io.SEEK_END:
-            offset += self.size
-        elif whence != io.SEEK_SET:
-            raise ValueError("invalid seek mode")
-        if offset < 0 or offset > self.size:
-            raise ValueError("DEFLATE seek outside the archive")
-        if offset == self.position:
-            return offset
-        buffer_start = self._produced - len(self._buffer)
-        if buffer_start <= offset <= self._produced:
-            self._buffer_position = offset - buffer_start
-            self.position = offset
-            return offset
-        checkpoint_index = bisect.bisect_right(self._checkpoint_offsets, offset) - 1
-        checkpoint_position, compressed_position, decoder = self._checkpoints[checkpoint_index]
-        if offset < self.position or checkpoint_position > self.position:
-            self._decoder = decoder.copy()
-            self._compressed_position = compressed_position
-            self._produced = checkpoint_position
-            self._buffer = b""
-            self._buffer_position = 0
-            self.position = checkpoint_position
-        while self.position < offset:
-            self.read(min(1024 * 1024, offset - self.position))
-        return self.position
 
 
 @dataclass(frozen=True)
@@ -657,6 +541,14 @@ def _indexed_progress(members: tuple[_IndexedTarMember, ...] | list[_IndexedTarM
     return max((member.offset_data + member.size for member in members), default=0)
 
 
+def _indexed_tar_members(archive: tarfile.TarFile) -> list[_IndexedTarMember]:
+    return [
+        _IndexedTarMember(name=member.name, size=member.size, offset_data=member.offset_data)
+        for member in archive.members
+        if member.isfile()
+    ]
+
+
 def _prefer_indexed_member(member: _IndexedTarMember) -> bool:
     buffer_size = min(
         _TAR_INDEX_MEMBER_BUFFER_SIZE,
@@ -813,6 +705,25 @@ def _open_firmware_tar(
     remote: _RemoteFirmwareArchive,
     outer_entry: zipfile.ZipInfo,
 ) -> Iterator[tarfile.TarFile]:
+    if outer_entry.compress_type == zipfile.ZIP_DEFLATED:
+        with _open_indexed_firmware_entry(remote, outer_entry) as indexed_source:
+            try:
+                archive = tarfile.open(fileobj=indexed_source, mode="r|")
+            except tarfile.TarError as exc:
+                raise FUSError(f"archive entry {outer_entry.filename!r} is not a readable TAR: {exc}") from exc
+            try:
+                with closing(archive):
+                    yield archive
+            finally:
+                _save_tar_index(
+                    remote,
+                    outer_entry,
+                    indexed_source,
+                    _indexed_tar_members(archive),
+                    complete=False,
+                )
+        return
+
     with remote.archive.open(outer_entry, "r") as source:
         mode = "r:" if outer_entry.compress_type == zipfile.ZIP_STORED else "r|"
         try:
@@ -1177,22 +1088,28 @@ def download_firmware_partition_files(
             if outer.compress_type == zipfile.ZIP_STORED:
                 outer_view = ImageView(remote.reader, _zip_entry_data_offset(remote, outer), outer.file_size)
             elif outer.compress_type == zipfile.ZIP_DEFLATED:
-                source = stack.enter_context(
-                    _DeflateArchiveReader(
-                        remote.reader,
-                        data_offset=_zip_entry_data_offset(remote, outer),
-                        compressed_size=outer.compress_size,
-                        uncompressed_size=outer.file_size,
+                cached = _load_tar_index(remote, outer)
+                try:
+                    source = stack.enter_context(
+                        _open_indexed_firmware_entry(
+                            remote,
+                            outer,
+                            index_path=cached.index_path if cached is not None else None,
+                        )
                     )
-                )
+                except StreamSourceError:
+                    _discard_tar_index(remote, outer)
+                    source = stack.enter_context(_open_indexed_firmware_entry(remote, outer))
                 outer_view = ImageView(source, 0, outer.file_size)
             else:
                 raise FUSError(f"unsupported ZIP compression for {outer.filename!r}")
             stream = _ImageStream(outer_view)
-            # Sequential TAR iteration keeps the DEFLATE decoder moving forward.
-            # Random TAR seeks can replay large compressed ranges from FUS.
             tar_mode = "r|" if outer.compress_type == zipfile.ZIP_DEFLATED else "r:"
             tar = stack.enter_context(tarfile.open(fileobj=stream, mode=tar_mode))
+            if outer.compress_type == zipfile.ZIP_DEFLATED:
+                stack.callback(
+                    lambda: _save_tar_index(remote, outer, source, _indexed_tar_members(tar), complete=False)
+                )
             direct: dict[str, list[tarfile.TarInfo]] = {name: [] for name in requested}
             super_images: list[tarfile.TarInfo] = []
             image_names = {
