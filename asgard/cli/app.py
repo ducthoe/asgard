@@ -13,13 +13,54 @@ from typing import TYPE_CHECKING, Any
 from .. import __version__
 from ..core.errors import FUSError, report_error
 from . import settings
+from .help import HelpParser
 from .progress import format_bytes, set_quiet
 
 if TYPE_CHECKING:
     from .. import fus
 
 _HISTORY_WRAP_WIDTH = 100
-_FIRMWARE_HELP = "Firmware version to use, for example S721BXXSACZB2/S721BOXMACZB2/S721BXXSACZB2/S721BXXSACZB2"
+_FIRMWARE_HELP = "Full four-part firmware version, as shown by history"
+_COMMAND_GROUPS = (
+    (
+        "Find firmware",
+        (
+            ("checkupdate", "Find the latest release for a model and CSC"),
+            ("history", "Browse older firmware releases and their details"),
+            ("compare", "Compare releases across two CSCs"),
+        ),
+    ),
+    (
+        "Download and extract",
+        (
+            ("download", "Get firmware, extract archive files or partitions, read partition paths, or apply an OTA"),
+            ("decrypt", "Decrypt a downloaded FUS package"),
+            ("batch", "Run multiple download jobs from TOML or JSON"),
+        ),
+    ),
+    (
+        "Inspect local files",
+        (
+            ("verify", "Inspect a local package or image and calculate hashes"),
+            ("manifest", "Create a JSON verification manifest for a file"),
+            ("ota-info", "Inspect an A/B or block OTA and its targets"),
+        ),
+    ),
+    ("Settings", (("profile", "Save and reuse model/CSC profiles"),)),
+)
+_COMMAND_HELP = {name: description for _group, commands in _COMMAND_GROUPS for name, description in commands}
+_ROOT_EXAMPLES = (
+    ("Download and decrypt", "asgard download MODEL CSC --decrypt --resume -o DIR"),
+    ("Read a partition file", "asgard download MODEL CSC --archive AP --path /system/build.prop -o DIR"),
+    ("Apply an OTA", "asgard download MODEL CSC --ota update.zip -o DIR"),
+)
+_DOWNLOAD_EXAMPLES = (
+    ("Whole firmware", "asgard download MODEL CSC --decrypt --resume -o DIR"),
+    ("One archive file", "asgard download MODEL CSC --archive AP --file boot.img.lz4 -o DIR"),
+    ("Logical partition", "asgard download MODEL CSC --archive AP --partition system -o DIR"),
+    ("File inside a partition", "asgard download MODEL CSC --archive AP --path /system/build.prop -o DIR"),
+    ("Apply an OTA", "asgard download MODEL CSC --ota update.zip -o DIR"),
+)
 _HISTORY_DETAIL_SKIP_TAGS = {
     "ANDROID_VERSION",
     "BINARY_ANDROID_VERSION",
@@ -143,7 +184,9 @@ def _add_output_mode(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_network_options(parser: argparse.ArgumentParser, *, threads: bool = False) -> None:
-    parser.add_argument("--timeout", type=_positive_int, default=30, metavar="SECONDS")
+    parser.add_argument(
+        "--timeout", type=_positive_int, default=30, metavar="SECONDS", help="Network timeout in seconds"
+    )
     parser.add_argument("--limit-rate", type=_parse_byte_rate, metavar="RATE", help="Aggregate limit, e.g. 10M")
     if threads:
         parser.add_argument("--threads", type=_positive_int, help="Override automatic download or decrypt workers")
@@ -203,42 +246,53 @@ def _result_dict(result: fus.DownloadResult) -> dict[str, object]:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="asgard", description=f"asgard {__version__}")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser = HelpParser(
+        prog="asgard", description=f"asgard {__version__}", command_groups=_COMMAND_GROUPS, examples=_ROOT_EXAMPLES
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
-    check = subparsers.add_parser("checkupdate", help="Get the latest firmware version")
+    def add_command(name: str, **kwargs: Any) -> argparse.ArgumentParser:
+        return subparsers.add_parser(name, help=_COMMAND_HELP[name], **kwargs)
+
+    check = add_command("checkupdate")
     _add_device_args(check)
     _add_network_options(check)
     _add_output_mode(check)
 
-    history = subparsers.add_parser("history", help="Show firmware history for a device and CSC")
+    history = add_command("history")
     _add_device_args(history)
     _add_network_options(history)
     _add_output_mode(history)
 
-    download = subparsers.add_parser("download", help="Download firmware or selected firmware content")
+    download = add_command(
+        "download",
+        usage="%(prog)s [options] model [region]",
+        description="Download a package, extract a TAR member or partition, read files inside a partition, or merge an OTA.",
+        examples=_DOWNLOAD_EXAMPLES,
+    )
     _add_device_args(download)
-    _add_firmware_arg(download)
-    download.add_argument("-o", "--output", help="Output file or directory; content extraction uses a directory")
-    download.add_argument("--resume", action="store_true", help="Resume downloads and extraction staging")
-    download.add_argument("--decrypt", action="store_true", help="Decrypt while downloading")
-    content = download.add_mutually_exclusive_group()
+    source = download.add_argument_group("Firmware source")
+    _add_firmware_arg(source)
+    source.add_argument(
+        "--archive", action="append", metavar="SELECTOR", help="Archive selector; repeatable/globs allowed"
+    )
+
+    selection = download.add_argument_group("Select content")
+    content = selection.add_mutually_exclusive_group()
     content.add_argument("--list-entries", action="store_true", help="List firmware ZIP or selected TAR entries")
     content.add_argument("--file", metavar="NAME", help="Extract one file from --archive")
     content.add_argument("--list-partitions", action="store_true", help="List logical super partitions")
     content.add_argument("--partition", action="append", metavar="NAME", help="Extract a logical partition; repeatable")
     content.add_argument("--unpack-super", action="store_true", help="Extract every logical super partition")
-    download.add_argument(
+    selection.add_argument(
         "--path", action="append", metavar="/PARTITION/FILE", help="Download a file by its full device path; repeatable"
     )
-    download.add_argument(
-        "--archive", action="append", metavar="SELECTOR", help="Archive selector; repeatable/globs allowed"
-    )
-    download.add_argument("--keep-sparse", action="store_true", help="Keep Android sparse images sparse")
-    download.add_argument("--ota", metavar="ZIP", help="Merge an OTA ZIP with its base firmware")
-    download.add_argument("--ota-format", choices=("auto", "ab", "block"), default="auto")
-    download.add_argument("--ota-base-dir", metavar="DIR", help="Use local base images before downloading")
-    download.add_argument(
+
+    ota = download.add_argument_group("OTA merge")
+    ota.add_argument("--ota", metavar="ZIP", help="Merge an OTA ZIP with its base firmware")
+    ota.add_argument("--ota-format", choices=("auto", "ab", "block"), default="auto", help="Select OTA format")
+    ota.add_argument("--ota-base-dir", metavar="DIR", help="Use local base images before downloading")
+    ota.add_argument(
         "--ota-base-image",
         action="append",
         type=_ota_base_image,
@@ -246,39 +300,47 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="PARTITION=PATH",
         help="Override one OTA base image; repeatable",
     )
-    download.add_argument(
+    ota.add_argument(
         "--ota-partition",
         action="append",
         metavar="SELECTOR",
         help="Merge matching partition images; repeatable, commas/globs allowed",
     )
-    download.add_argument(
+    ota.add_argument(
         "--ota-file",
         action="append",
         metavar="SELECTOR",
         help="Extract matching full OTA files; repeatable, commas/globs allowed",
     )
-    download.add_argument("--ota-jobs", type=_positive_int, metavar="N", help="Override automatic OTA merge workers")
-    download.add_argument("--ota-no-verify", action="store_true", help="Skip OTA source and target hashes")
-    download.add_argument("--ota-keep-base", action="store_true", help="Keep downloaded base images")
-    download.add_argument("--ota-force", action="store_true", help="Allow a base mismatch and replace outputs")
-    download.add_argument("--ota-list-targets", action="store_true", help="List selectable targets and sizes")
-    _add_network_options(download, threads=True)
-    _add_output_mode(download)
-    _add_manifest_option(download)
+    ota.add_argument("--ota-jobs", type=_positive_int, metavar="N", help="Override automatic OTA merge workers")
+    ota.add_argument("--ota-no-verify", action="store_true", help="Skip OTA source and target hashes")
+    ota.add_argument("--ota-keep-base", action="store_true", help="Keep downloaded base images")
+    ota.add_argument("--ota-force", action="store_true", help="Allow a base mismatch and replace outputs")
+    ota.add_argument("--ota-list-targets", action="store_true", help="List selectable targets and sizes")
 
-    decrypt = subparsers.add_parser("decrypt", help="Decrypt an encrypted FUS package")
+    output = download.add_argument_group("Output")
+    output.add_argument("-o", "--output", help="Output file or directory; content extraction uses a directory")
+    output.add_argument("--resume", action="store_true", help="Resume downloads and extraction staging")
+    output.add_argument("--decrypt", action="store_true", help="Decrypt while downloading")
+    output.add_argument("--keep-sparse", action="store_true", help="Keep Android sparse images sparse")
+    _add_output_mode(output)
+    _add_manifest_option(output)
+
+    network = download.add_argument_group("Network and performance")
+    _add_network_options(network, threads=True)
+
+    decrypt = add_command("decrypt", usage="%(prog)s [options] model [region] input")
     _add_device_args(decrypt)
-    decrypt.add_argument("input")
-    decrypt.add_argument("-o", "--output")
+    decrypt.add_argument("input", help="Encrypted FUS package")
+    decrypt.add_argument("-o", "--output", help="Decrypted output file")
     _add_firmware_arg(decrypt)
-    decrypt.add_argument("--enc-ver", type=int, choices=[2, 4], default=4)
-    decrypt.add_argument("--resume", action="store_true")
+    decrypt.add_argument("--enc-ver", type=int, choices=[2, 4], default=4, help="Encryption version")
+    decrypt.add_argument("--resume", action="store_true", help="Resume an interrupted decryption")
     _add_network_options(decrypt, threads=True)
     _add_output_mode(decrypt)
     _add_manifest_option(decrypt)
 
-    compare = subparsers.add_parser("compare", help="Compare firmware history between two CSCs")
+    compare = add_command("compare")
     compare.add_argument("model")
     compare.add_argument("region_a")
     compare.add_argument("region_b")
@@ -287,7 +349,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_network_options(compare)
     _add_output_mode(compare)
 
-    batch = subparsers.add_parser("batch", help="Download jobs from a TOML or JSON file")
+    batch = add_command("batch")
     batch.add_argument("file")
     batch.add_argument("-o", "--output", help="Default output directory")
     batch.add_argument("--fail-fast", action="store_true")
@@ -295,12 +357,12 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_network_options(batch, threads=True)
     _add_output_mode(batch)
 
-    verify = subparsers.add_parser("verify", help="Validate a local package/image and calculate hashes")
+    verify = add_command("verify")
     verify.add_argument("file")
     verify.add_argument("--no-entries", action="store_true", help="Do not include archive entry metadata")
     _add_output_mode(verify)
 
-    manifest = subparsers.add_parser("manifest", help="Create a JSON verification manifest")
+    manifest = add_command("manifest")
     manifest.add_argument("file")
     manifest.add_argument("-o", "--output")
     manifest.add_argument("--model")
@@ -308,26 +370,26 @@ def _build_parser() -> argparse.ArgumentParser:
     manifest.add_argument("--firmware")
     _add_output_mode(manifest)
 
-    ota_info = subparsers.add_parser("ota-info", help="Inspect an A/B or block OTA ZIP")
+    ota_info = add_command("ota-info")
     ota_info.add_argument("input")
     ota_info.add_argument("--format", choices=("auto", "ab", "block"), default="auto")
     ota_info.add_argument("--no-verify", action="store_true", help="Skip payload metadata verification")
     _add_output_mode(ota_info)
 
-    profile = subparsers.add_parser("profile", help="Manage saved model/CSC profiles")
-    profile_sub = profile.add_subparsers(dest="profile_command", required=True)
-    profile_list = profile_sub.add_parser("list")
+    profile = add_command("profile")
+    profile_sub = profile.add_subparsers(dest="profile_command", required=True, metavar="COMMAND")
+    profile_list = profile_sub.add_parser("list", help="List saved profiles")
     profile_list.add_argument("--json", action="store_true")
-    profile_add = profile_sub.add_parser("add")
+    profile_add = profile_sub.add_parser("add", help="Save a model and CSC under a name")
     profile_add.add_argument("name")
     profile_add.add_argument("model")
     profile_add.add_argument("region")
     profile_add.add_argument("--replace", action="store_true")
     profile_add.add_argument("--json", action="store_true")
-    profile_show = profile_sub.add_parser("show")
+    profile_show = profile_sub.add_parser("show", help="Show one saved profile")
     profile_show.add_argument("name")
     profile_show.add_argument("--json", action="store_true")
-    profile_remove = profile_sub.add_parser("remove")
+    profile_remove = profile_sub.add_parser("remove", help="Remove a saved profile")
     profile_remove.add_argument("name")
     profile_remove.add_argument("--json", action="store_true")
 
