@@ -10,16 +10,43 @@ import re
 import shutil
 import sys
 import textwrap
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TextIO
 
 _BOLD = "\x1b[1m"
 _RESET = "\x1b[0m"
 _OPTION = re.compile(r"(?<!\S)--?[A-Za-z][A-Za-z0-9-]*")
+_ENABLE_PROCESSED_OUTPUT = 0x0001
+_ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 
 
 def _help_width() -> int:
     return max(40, min(shutil.get_terminal_size(fallback=(80, 24)).columns - 2, 120))
+
+
+def _windows_vt_output(output: TextIO) -> tuple[bool, Callable[[], object] | None]:
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetConsoleMode.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel.GetConsoleMode.restype = wintypes.BOOL
+        kernel.SetConsoleMode.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel.SetConsoleMode.restype = wintypes.BOOL
+        handle = msvcrt.get_osfhandle(output.fileno())
+        mode = wintypes.DWORD()
+        if not kernel.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False, None
+        if mode.value & _ENABLE_VIRTUAL_TERMINAL_PROCESSING:
+            return True, None
+        enabled = mode.value | _ENABLE_PROCESSED_OUTPUT | _ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        if not kernel.SetConsoleMode(handle, enabled):
+            return False, None
+        return True, lambda: kernel.SetConsoleMode(handle, mode.value)
+    except (AttributeError, ImportError, OSError, ValueError):
+        return False, None
 
 
 class CompactHelpFormatter(argparse.HelpFormatter):
@@ -132,9 +159,19 @@ class HelpParser(argparse.ArgumentParser):
     def print_help(self, file: TextIO | None = None) -> None:
         output = sys.stdout if file is None else file
         content = self.format_help()
-        if output.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb":
+        bold = output.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
+        restore = None
+        if bold and os.name == "nt":
+            bold, restore = _windows_vt_output(output)
+        if bold:
             content = _bold_help(content, self.command_groups)
-        output.write(content)
+        try:
+            output.write(content)
+            if restore is not None:
+                output.flush()
+        finally:
+            if restore is not None:
+                restore()
 
 
 def _bold_help(content: str, groups: CommandGroups | None) -> str:
