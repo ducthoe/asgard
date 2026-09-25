@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import re
 import shutil
 import sys
@@ -109,7 +110,9 @@ class HelpParser(argparse.ArgumentParser):
 
         if self.examples:
             lines = [content.rstrip(), "", "Examples:"]
-            for label, command in self.examples:
+            examples = list(self.examples)
+            random.shuffle(examples)
+            for label, command in examples:
                 lines.append(f"  {label}:")
                 lines.extend(
                     textwrap.wrap(
