@@ -72,9 +72,12 @@ asgard download SM-S721B EUX \
 ```
 
 Downloads use a small number of workers by default: at most four for a large
-file, and fewer when the file or system is smaller. Asgard starts with fewer
-active streams, opens more when requests succeed, and slows down after HTTP
-429 or 503 responses. When the server sends `Retry-After`, Asgard follows it.
+file, and fewer when the file or system is smaller. Asgard starts with one
+active stream and measures transfer speed before adding another. It keeps
+additional concurrency when aggregate throughput improves by at least 10%.
+Requests are briefly spaced apart, and larger ranges reduce request overhead.
+After HTTP 429 or 503 responses, workers share a cooldown and reduce concurrency.
+When the server sends `Retry-After`, Asgard follows it.
 You can set your own worker limit with `--threads N`, though a high value may
 slow a download or trigger more rate limits.
 
@@ -182,6 +185,12 @@ unsuffixed partition first, then slot A, then slot B.
 
 For resumed extraction, Asgard keeps the source stream locally so it can
 rebuild decoded output without fetching the same source data again.
+
+Remote reads cache up to 8 MiB of decrypted data in memory. Small metadata
+lookups fetch 64 KiB blocks and reuse connections; sequential reads switch
+to a continuous stream. Interrupted range requests retain bytes already
+received. Ext4 and uncompressed EROFS files are extracted in batches of up
+to 1 MiB.
 
 ## Apply an OTA update
 
@@ -344,6 +353,20 @@ change:
 ```console
 ruff check asgard
 ```
+
+Run the regression tests with `python3 -m pytest`. They use a local HTTP server
+to check interrupted transfers, range validation, rate limits, cache reuse,
+decryption, and extraction without contacting FUS.
+
+To compare request counts, transferred bytes, and extraction time with an
+earlier Git revision:
+
+```console
+python3 -m benchmarks.performance --baseline REVISION --latency-ms 50
+```
+
+The benchmark serves synthetic firmware locally. Its timing reflects the
+configured request latency and local hardware.
 
 ## License
 

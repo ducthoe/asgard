@@ -264,4 +264,21 @@ class EROFS:
         return inode
 
     def iter_file(self, inode: _Inode) -> Iterator[bytes]:
+        if inode.layout in (0, 2):
+            full, tail = divmod(inode.size, self.block_size)
+            remaining = full * self.block_size
+            position = inode.start_block * self.block_size
+            while remaining:
+                amount = min(remaining, 1024 * 1024)
+                yield self.image.read_at(position, amount)
+                position += amount
+                remaining -= amount
+            if tail:
+                position = (
+                    inode.position + inode.inode_size + inode.xattr_size
+                    if inode.layout == 2
+                    else (inode.start_block + full) * self.block_size
+                )
+                yield self.image.read_at(position, tail)
+            return
         yield from self._data(inode)

@@ -123,6 +123,17 @@ def _download_ranges_parallel(
     if rate_limiter is not None and rate_limiter.rate > 0:
         chunk_size = min(chunk_size, max(_AES_BLOCK_SIZE, int(rate_limiter.rate * _PROGRESS_REFRESH_S)))
 
+    def write_chunk(fh, data: bytes | memoryview) -> None:
+        view = memoryview(data)
+        while view:
+            try:
+                written = fh.write(view)
+            except OSError as exc:
+                raise FUSError(f"could not write downloaded data: {exc}") from exc
+            if written is None or written <= 0:
+                raise FUSError("could not write downloaded data")
+            view = view[written:]
+
     def worker(range_idx: int) -> None:
         segment = ranges[range_idx]
         seg_end = int(segment["end"])
@@ -154,7 +165,6 @@ def _download_ranges_parallel(
                         end=seg_end,
                         total_size=total_size,
                     )
-                    gate.accepted()
                     expected_response_size = seg_end - request_start + 1
                     response_received = 0
                     fh.seek(write_offset)
@@ -166,7 +176,9 @@ def _download_ranges_parallel(
                         if network_progress is not None:
                             network_progress(len(chunk))
                         if rate_limiter is not None:
-                            rate_limiter.consume(len(chunk))
+                            rate_limiter.consume(len(chunk), stop_event)
+                        if stop_event.is_set():
+                            return
                         if len(chunk) > expected_response_size - response_received:
                             raise RetryableDownloadError(f"range {range_idx + 1} received more data than requested")
                         response_received += len(chunk)
@@ -174,7 +186,7 @@ def _download_ranges_parallel(
                         if cipher is None:
                             if len(chunk) > remaining:
                                 raise RetryableDownloadError(f"range {range_idx + 1} received more data than requested")
-                            fh.write(chunk)
+                            write_chunk(fh, chunk)
                             write_offset += len(chunk)
                         else:
                             pending = pending + chunk if pending else chunk
@@ -185,11 +197,11 @@ def _download_ranges_parallel(
                                         f"range {range_idx + 1} received more data than requested"
                                     )
                                 block = memoryview(pending)[:block_size]
-                                pending = pending[block_size:]
                                 plain = decrypted_view[:block_size]
                                 cipher.decrypt(block, output=plain)
-                                fh.write(plain)
+                                write_chunk(fh, plain)
                                 write_offset += len(plain)
+                                pending = pending[block_size:]
                         with state_lock:
                             segment["offset"] = write_offset
                     if response_received != expected_response_size:
@@ -274,6 +286,8 @@ def _download_ranges_parallel(
                 done = _resume_done_bytes(ranges)
                 err = errors[0] if errors else None
                 snapshot = [dict(item) for item in ranges]
+            if gate is not None:
+                gate.observe(done - initial_done)
             _render_progress(
                 "Decrypting" if decrypt_key is not None else "Downloading",
                 done,
@@ -335,86 +349,86 @@ def download_firmware(
     worker_count = int(threads) if threads is not None else None
     if worker_count is not None and worker_count <= 0:
         raise ValueError("threads must be positive")
-    client = FUSClient(timeout_s=timeout_s)
-    info = _resolve_versioned_info(client, model_u, region_u, firmware_version)
-    firmware = info.binary_version or ""
-    if not firmware:
-        raise FUSError("FUS did not return a firmware version")
-    if worker_count is None:
-        worker_count = download_worker_count(info.size)
+    with FUSClient(timeout_s=timeout_s) as client:
+        info = _resolve_versioned_info(client, model_u, region_u, firmware_version)
+        firmware = info.binary_version or ""
+        if not firmware:
+            raise FUSError("FUS did not return a firmware version")
+        if worker_count is None:
+            worker_count = download_worker_count(info.size)
 
-    final_path = _download_output_path(
-        filename=info.filename,
-        out_dir=out_dir,
-        out_file=out_file,
-        auto_decrypt=auto_decrypt,
-    )
-    encrypted_path = _encrypted_target_path(filename=info.filename, out_dir=out_dir, out_file=out_file)
-    temp_path = _partial_output_path(final_path) if auto_decrypt else encrypted_path
-    final_path.parent.mkdir(parents=True, exist_ok=True)
+        final_path = _download_output_path(
+            filename=info.filename,
+            out_dir=out_dir,
+            out_file=out_file,
+            auto_decrypt=auto_decrypt,
+        )
+        encrypted_path = _encrypted_target_path(filename=info.filename, out_dir=out_dir, out_file=out_file)
+        temp_path = _partial_output_path(final_path) if auto_decrypt else encrypted_path
+        final_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if final_path.exists() and auto_decrypt:
-        raise FUSError(f"{final_path} already exists")
-    if encrypted_path.exists() and not auto_decrypt and not resume:
-        raise FUSError(f"{encrypted_path} already exists, use --resume or choose another output")
+        if final_path.exists() and auto_decrypt:
+            raise FUSError(f"{final_path} already exists")
+        if encrypted_path.exists() and not auto_decrypt and not resume:
+            raise FUSError(f"{encrypted_path} already exists, use --resume or choose another output")
 
-    ranges, meta_path = _prepare_range_resume_state(
-        temp_path,
-        info.size,
-        resume,
-        part_count=1,
-        alignment=_AES_BLOCK_SIZE if auto_decrypt else 1,
-    )
-    done_before = _resume_done_bytes(ranges)
+        ranges, meta_path = _prepare_range_resume_state(
+            temp_path,
+            info.size,
+            resume,
+            part_count=1,
+            alignment=_AES_BLOCK_SIZE if auto_decrypt else 1,
+        )
+        done_before = _resume_done_bytes(ranges)
 
-    initialize_download(client, info, region_u)
-    client.configure_download_pool(worker_count)
-    remote_path = f"{info.model_path}{info.filename}"
-
-    def recover_download() -> None:
-        client.refresh_auth()
         initialize_download(client, info, region_u)
+        client.configure_download_pool(worker_count)
+        remote_path = f"{info.model_path}{info.filename}"
 
-    _print_info(f"model: {model_u}")
-    _print_info(f"region: {region_u}")
-    _print_info(f"firmware: {firmware}")
-    _print_info(f"filename: {info.filename}")
-    _print_info(f"size: {_format_bytes(info.size)}")
-    _print_info(f"output: {final_path if auto_decrypt else temp_path}")
-    if done_before:
-        _print_info(f"resume: {_format_bytes(done_before)}")
-    limiter = BandwidthLimiter(rate_limit)
+        def recover_download() -> None:
+            client.refresh_auth()
+            initialize_download(client, info, region_u)
 
-    if not auto_decrypt:
+        _print_info(f"model: {model_u}")
+        _print_info(f"region: {region_u}")
+        _print_info(f"firmware: {firmware}")
+        _print_info(f"filename: {info.filename}")
+        _print_info(f"size: {_format_bytes(info.size)}")
+        _print_info(f"output: {final_path if auto_decrypt else temp_path}")
+        if done_before:
+            _print_info(f"resume: {_format_bytes(done_before)}")
+        limiter = BandwidthLimiter(rate_limit)
+
+        if not auto_decrypt:
+            if done_before < info.size:
+                _download_ranges_parallel(
+                    client=client,
+                    remote_path=remote_path,
+                    out_path=temp_path,
+                    total_size=info.size,
+                    ranges=ranges,
+                    recover_download=recover_download,
+                    rate_limiter=limiter,
+                    workers=worker_count,
+                )
+            meta_path.unlink(missing_ok=True)
+            return DownloadResult(temp_path, None, firmware, info.filename, info.size)
+
+        decrypt_key = _decryption_key_from_info(info, model_u, region_u)
         if done_before < info.size:
-            _download_ranges_parallel(
-                client=client,
-                remote_path=remote_path,
-                out_path=temp_path,
-                total_size=info.size,
-                ranges=ranges,
-                recover_download=recover_download,
-                rate_limiter=limiter,
-                workers=worker_count,
-            )
+            with PipelineProgress() as progress:
+                _download_ranges_parallel(
+                    client=client,
+                    remote_path=remote_path,
+                    out_path=temp_path,
+                    total_size=info.size,
+                    ranges=ranges,
+                    decrypt_key=decrypt_key,
+                    recover_download=recover_download,
+                    rate_limiter=limiter,
+                    workers=worker_count,
+                    network_progress=progress.add_download,
+                )
         meta_path.unlink(missing_ok=True)
-        return DownloadResult(temp_path, None, firmware, info.filename, info.size)
-
-    decrypt_key = _decryption_key_from_info(info, model_u, region_u)
-    if done_before < info.size:
-        with PipelineProgress() as progress:
-            _download_ranges_parallel(
-                client=client,
-                remote_path=remote_path,
-                out_path=temp_path,
-                total_size=info.size,
-                ranges=ranges,
-                decrypt_key=decrypt_key,
-                recover_download=recover_download,
-                rate_limiter=limiter,
-                workers=worker_count,
-                network_progress=progress.add_download,
-            )
-    meta_path.unlink(missing_ok=True)
-    final_stream_path = _finalize_stream_decrypted_file(temp_path, final_path)
-    return DownloadResult(encrypted_path, final_stream_path, firmware, info.filename, info.size)
+        final_stream_path = _finalize_stream_decrypted_file(temp_path, final_path)
+        return DownloadResult(encrypted_path, final_stream_path, firmware, info.filename, info.size)

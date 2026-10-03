@@ -48,6 +48,14 @@ class FUSClient(FUSAuth):
         self._owns_session = session is None
         super().__init__()
         self._refresh_lock = threading.Lock()
+        self._auth_generation = 0
+
+    def __enter__(self) -> FUSClient:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        if self._owns_session:
+            self.session.close()
 
     def configure_download_pool(self, workers: int) -> None:
         if self._owns_session:
@@ -75,6 +83,7 @@ class FUSClient(FUSAuth):
         body = response.text
         response.raise_for_status()
         self._update_identity_state(response)
+        self._auth_generation += 1
         return body
 
     def ensure_auth(self) -> None:
@@ -86,11 +95,17 @@ class FUSClient(FUSAuth):
         with self._refresh_lock:
             return self._refresh_auth_unlocked()
 
+    def _refresh_auth_if_stale(self, generation: int) -> None:
+        with self._refresh_lock:
+            if generation == self._auth_generation:
+                self._refresh_auth_unlocked()
+
     def make_request(self, path: str, data: bytes | str = b"") -> str:
         if path == self.GENERATE_NONCE_PATH:
             return self.refresh_auth()
         for attempt in range(2):
             self.ensure_auth()
+            generation = self._auth_generation
             response = self.session.post(
                 f"{_FUS_BASE_URL}{path}",
                 data=data,
@@ -99,7 +114,8 @@ class FUSClient(FUSAuth):
             )
             body = response.text
             if self._response_is_401(response, body) and attempt == 0:
-                self.refresh_auth()
+                response.close()
+                self._refresh_auth_if_stale(generation)
                 continue
             response.raise_for_status()
             self._update_identity_state(response)
@@ -126,6 +142,7 @@ class FUSClient(FUSAuth):
     ) -> requests.Response:
         url = f"{_FUS_DOWNLOAD_URL}?file={remote_path}"
         for attempt in range(2):
+            generation = self._auth_generation
             headers = self._download_headers()
             if end is not None:
                 headers["Range"] = f"bytes={start}-{end}"
@@ -134,7 +151,7 @@ class FUSClient(FUSAuth):
             response = self.session.get(url, headers=headers, stream=True, timeout=self.timeout_s)
             if response.status_code == 401 and attempt == 0:
                 response.close()
-                self.refresh_auth()
+                self._refresh_auth_if_stale(generation)
                 time.sleep(_RETRY_BACKOFF_S)
                 continue
             if response.status_code in (429, 503):
@@ -148,7 +165,11 @@ class FUSClient(FUSAuth):
                 raise RetryableDownloadError(
                     f"download server ignored requested byte range ({status}): {headers['Range']}"
                 )
-            response.raise_for_status()
-            self._update_identity_state(response)
+            try:
+                response.raise_for_status()
+                self._update_identity_state(response)
+            except Exception:
+                response.close()
+                raise
             return response
         raise FUSError("FUS download authorization failed after nonce refresh")

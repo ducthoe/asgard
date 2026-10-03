@@ -14,7 +14,7 @@ from pathlib import Path
 from Cryptodome.Cipher import AES
 
 from ..cli.progress import render_progress as _render_progress
-from ..core.constants import _AES_BLOCK_SIZE, _PROGRESS_REFRESH_S
+from ..core.constants import _AES_BLOCK_SIZE, _PROGRESS_REFRESH_S, _RESUME_META_SAVE_INTERVAL_S
 from ..core.errors import FUSError
 from ..core.resources import decrypt_worker_count
 from .auth import get_logic_check
@@ -52,8 +52,8 @@ def get_v4_key(
     firmware_version: str | None = None,
     timeout_s: int = 30,
 ) -> bytes:
-    client = FUSClient(timeout_s=timeout_s)
-    info = _resolve_versioned_info(client, model, region, firmware_version)
+    with FUSClient(timeout_s=timeout_s) as client:
+        info = _resolve_versioned_info(client, model, region, firmware_version)
     binary_version = info.binary_version
     logic_value = info.logic_value
     if not binary_version or not logic_value:
@@ -179,25 +179,34 @@ def decrypt_firmware(
             with done_lock:
                 item["offset"] = end + 1
 
-    with ThreadPoolExecutor(max_workers=min(worker_count, len(ranges)) or 1) as executor:
-        futures = [executor.submit(worker, item) for item in ranges]
-        last_saved = -1
-        while True:
-            completed = all(future.done() for future in futures)
-            with done_lock:
-                current_done = done
-                snapshot = [dict(item) for item in ranges]
-            _render_progress(
-                "Decrypting", current_done, length, started_at, complete=completed and current_done >= length
-            )
-            if current_done != last_saved:
-                _save_range_resume_state(meta_path, length, snapshot)
-                last_saved = current_done
-            if completed:
-                for future in futures:
-                    future.result()
-                break
-            time.sleep(_PROGRESS_REFRESH_S)
+    try:
+        with ThreadPoolExecutor(max_workers=min(worker_count, len(ranges)) or 1) as executor:
+            futures = [executor.submit(worker, item) for item in ranges]
+            last_saved = -1
+            last_saved_at = 0.0
+            while True:
+                completed = all(future.done() for future in futures)
+                with done_lock:
+                    current_done = done
+                    snapshot = [dict(item) for item in ranges]
+                _render_progress(
+                    "Decrypting", current_done, length, started_at, complete=completed and current_done >= length
+                )
+                now = time.monotonic()
+                if current_done != last_saved and (completed or now - last_saved_at >= _RESUME_META_SAVE_INTERVAL_S):
+                    _save_range_resume_state(meta_path, length, snapshot)
+                    last_saved = current_done
+                    last_saved_at = now
+                if completed:
+                    for future in futures:
+                        future.result()
+                    break
+                time.sleep(_PROGRESS_REFRESH_S)
+
+    finally:
+        with done_lock:
+            snapshot = [dict(item) for item in ranges]
+        _save_range_resume_state(meta_path, length, snapshot)
 
     _finalize_decrypted_file(part_path)
     part_path.replace(out_path)

@@ -205,8 +205,8 @@ def get_firmware_history_with_client(client: FUSClient, model: str, region: str)
 
 
 def get_firmware_history(model: str, region: str, *, timeout_s: int = 15) -> list[FirmwareHistoryEntry]:
-    client = FUSClient(timeout_s=timeout_s)
-    return get_firmware_history_with_client(client, model, region)
+    with FUSClient(timeout_s=timeout_s) as client:
+        return get_firmware_history_with_client(client, model, region)
 
 
 def get_latest_history_version(client: FUSClient, model: str, region: str) -> str:
@@ -220,8 +220,8 @@ def get_latest_history_version(client: FUSClient, model: str, region: str) -> st
 
 
 def get_latest_version(model: str, region: str, *, timeout_s: int = 15) -> str:
-    client = FUSClient(timeout_s=timeout_s)
-    return get_latest_history_version(client, model, region)
+    with FUSClient(timeout_s=timeout_s) as client:
+        return get_latest_history_version(client, model, region)
 
 
 def get_binary_info_for_version(client: FUSClient, model: str, region: str, firmware_version: str) -> BinaryInfo:

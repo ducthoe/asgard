@@ -179,5 +179,59 @@ class Ext4:
     def find(self, path: str) -> _Inode:
         return self._find(path, 0)
 
+    def _extents(self, node: bytes, depth_limit: int = 5) -> Iterator[tuple[int, int, int | None]]:
+        if len(node) < 12 or _u16(node, 0) != 0xF30A:
+            raise FUSError("invalid ext4 extent tree")
+        entries, maximum, depth = struct.unpack_from("<HHH", node, 2)
+        if entries > maximum or 12 + entries * 12 > len(node) or depth > depth_limit:
+            raise FUSError("corrupt ext4 extent tree")
+        for index in range(entries):
+            entry = node[12 + 12 * index : 24 + 12 * index]
+            if depth:
+                child = _u32(entry, 4) | (_u16(entry, 8) << 32)
+                yield from self._extents(self.image.read_at(child * self.block_size, self.block_size), depth_limit - 1)
+            else:
+                count = _u16(entry, 4)
+                unwritten = count > 32768
+                count = count - 32768 if unwritten else count
+                if not count:
+                    raise FUSError("invalid ext4 extent length")
+                physical = None if unwritten else _u32(entry, 8) | (_u16(entry, 6) << 32)
+                yield _u32(entry, 0), count, physical
+
+    def _extent_data(self, inode: _Inode) -> Iterator[bytes]:
+        position = 0
+        previous_end = 0
+        for logical, blocks, physical in self._extents(inode.block):
+            if logical < previous_end:
+                raise FUSError("overlapping ext4 file extents")
+            previous_end = logical + blocks
+            start = min(logical * self.block_size, inode.size)
+            while position < start:
+                amount = min(start - position, 1024 * 1024)
+                yield bytes(amount)
+                position += amount
+            end = min((logical + blocks) * self.block_size, inode.size)
+            while position < end:
+                amount = min(end - position, 1024 * 1024)
+                offset = position - logical * self.block_size
+                yield (
+                    bytes(amount)
+                    if physical is None
+                    else self.image.read_at(physical * self.block_size + offset, amount)
+                )
+                position += amount
+            if position >= inode.size:
+                return
+        while position < inode.size:
+            amount = min(inode.size - position, 1024 * 1024)
+            yield bytes(amount)
+            position += amount
+
     def iter_file(self, inode: _Inode) -> Iterator[bytes]:
+        if inode.flags & 0x10000000:
+            raise FUSError("ext4 inline data is not supported")
+        if inode.flags & 0x80000:
+            yield from self._extent_data(inode)
+            return
         yield from self._data(inode)
