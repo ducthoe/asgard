@@ -6,6 +6,7 @@ from __future__ import annotations
 import threading
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from math import isfinite
@@ -49,6 +50,8 @@ class FUSClient(FUSAuth):
         super().__init__()
         self._refresh_lock = threading.Lock()
         self._auth_generation = 0
+        self._download_recovery: Callable[[], None] | None = None
+        self._download_recovery_lock = threading.Lock()
 
     def __enter__(self) -> FUSClient:
         return self
@@ -63,6 +66,19 @@ class FUSClient(FUSAuth):
                 _FUS_DOWNLOAD_URL,
                 requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=max(1, workers), pool_block=True),
             )
+
+    def configure_download_recovery(self, recovery: Callable[[], None]) -> None:
+        with self._download_recovery_lock:
+            self._download_recovery = recovery
+
+    def _recover_download_auth(self, generation: int) -> None:
+        with self._download_recovery_lock:
+            if generation != self._auth_generation:
+                return
+            if self._download_recovery is None:
+                self._refresh_auth_if_stale(generation)
+            else:
+                self._download_recovery()
 
     def _response_is_401(self, response: requests.Response, body: str) -> bool:
         if response.status_code == 401:
@@ -142,16 +158,19 @@ class FUSClient(FUSAuth):
     ) -> requests.Response:
         url = f"{_FUS_DOWNLOAD_URL}?file={remote_path}"
         for attempt in range(2):
-            generation = self._auth_generation
-            headers = self._download_headers()
+            with self._download_recovery_lock:
+                generation = self._auth_generation
+                headers = self._download_headers()
             if end is not None:
                 headers["Range"] = f"bytes={start}-{end}"
             elif start > 0:
                 headers["Range"] = f"bytes={start}-"
             response = self.session.get(url, headers=headers, stream=True, timeout=self.timeout_s)
-            if response.status_code == 401 and attempt == 0:
+            if response.status_code == 401:
                 response.close()
-                self._refresh_auth_if_stale(generation)
+                if attempt:
+                    raise FUSError("FUS download authorization failed after session recovery (HTTP 401)")
+                self._recover_download_auth(generation)
                 time.sleep(_RETRY_BACKOFF_S)
                 continue
             if response.status_code in (429, 503):

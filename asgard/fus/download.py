@@ -104,6 +104,8 @@ def _download_ranges_parallel(
 ) -> None:
     if workers is not None and workers <= 0:
         raise ValueError("threads must be positive")
+    if recover_download is not None:
+        client.configure_download_recovery(recover_download)
     workers = download_worker_count(total_size) if workers is None else workers
     ranges[:] = split_download_ranges(ranges, workers=workers)
     state_lock = threading.Lock()

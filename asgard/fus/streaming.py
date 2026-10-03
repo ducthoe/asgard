@@ -10,6 +10,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
 import requests
 from Cryptodome.Cipher import AES
@@ -103,6 +104,8 @@ def _read_download_range(
     gate: AdaptiveDownloadGate | None = None,
 ) -> bytes:
     expected_size = end - start + 1
+    if recover_download is not None:
+        client.configure_download_recovery(recover_download)
     gate = gate or AdaptiveDownloadGate(1)
     stop_event = threading.Event()
     chunks: list[bytes] = []
@@ -207,6 +210,7 @@ class _FUSDecryptingReader(io.RawIOBase):
         self._last_read_end: int | None = None
         self._sequential_bytes = 0
         self._stream_retry = False
+        self._streaming_reads = False
         self._stream_failures = 0
         self._stream_failure_position: int | None = None
 
@@ -232,6 +236,15 @@ class _FUSDecryptingReader(io.RawIOBase):
 
     def readable(self) -> bool:
         return True
+
+    @contextmanager
+    def streaming(self) -> Iterator[None]:
+        previous = self._streaming_reads
+        self._streaming_reads = True
+        try:
+            yield
+        finally:
+            self._streaming_reads = previous
 
     def seekable(self) -> bool:
         return True
@@ -352,7 +365,11 @@ class _FUSDecryptingReader(io.RawIOBase):
         super().close()
 
     def _open_stream(self) -> None:
-        small_read = self._read_hint <= _RANGE_CHUNK_SIZE and self._sequential_bytes <= _RANGE_CHUNK_SIZE
+        small_read = (
+            not self._streaming_reads
+            and self._read_hint <= _RANGE_CHUNK_SIZE
+            and self._sequential_bytes <= _RANGE_CHUNK_SIZE
+        )
         alignment = _RANGE_CHUNK_SIZE if small_read and not self._stream_retry else _AES_BLOCK_SIZE
         request_start = self._position - (self._position % alignment)
         request_end = (

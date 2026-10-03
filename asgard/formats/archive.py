@@ -15,7 +15,7 @@ import time
 import zipfile
 import zlib
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack, closing, contextmanager, suppress
+from contextlib import ExitStack, closing, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TypeVar
@@ -705,33 +705,20 @@ def _open_firmware_tar(
     remote: _RemoteFirmwareArchive,
     outer_entry: zipfile.ZipInfo,
 ) -> Iterator[tarfile.TarFile]:
-    if outer_entry.compress_type == zipfile.ZIP_DEFLATED:
-        with _open_indexed_firmware_entry(remote, outer_entry) as indexed_source:
+    with remote.reader.streaming(), remote.archive.open(outer_entry, "r") as entry_source:
+        mode = "r:" if outer_entry.compress_type == zipfile.ZIP_STORED else "r|"
+        source_context = (
+            nullcontext(entry_source)
+            if outer_entry.compress_type == zipfile.ZIP_STORED
+            else open_prefetched_stream(entry_source)
+        )
+        with source_context as source:
             try:
-                archive = tarfile.open(fileobj=indexed_source, mode="r|")
+                archive = tarfile.open(fileobj=source, mode=mode, bufsize=64 * 1024)
             except tarfile.TarError as exc:
                 raise FUSError(f"archive entry {outer_entry.filename!r} is not a readable TAR: {exc}") from exc
-            try:
-                with closing(archive):
-                    yield archive
-            finally:
-                _save_tar_index(
-                    remote,
-                    outer_entry,
-                    indexed_source,
-                    _indexed_tar_members(archive),
-                    complete=False,
-                )
-        return
-
-    with remote.archive.open(outer_entry, "r") as source:
-        mode = "r:" if outer_entry.compress_type == zipfile.ZIP_STORED else "r|"
-        try:
-            archive = tarfile.open(fileobj=source, mode=mode)
-        except tarfile.TarError as exc:
-            raise FUSError(f"archive entry {outer_entry.filename!r} is not a readable TAR: {exc}") from exc
-        with closing(archive):
-            yield archive
+            with closing(archive):
+                yield archive
 
 
 def iter_firmware_tar_entries(

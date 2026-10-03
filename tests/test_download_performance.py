@@ -4,6 +4,7 @@ import io
 import random
 import re
 import socket
+import tarfile
 import threading
 import time
 import zipfile
@@ -15,8 +16,10 @@ from types import SimpleNamespace
 import pytest
 import requests
 from Cryptodome.Cipher import AES
+from lz4 import frame as lz4_frame
 
 from asgard.core.errors import FUSError
+from asgard.formats import archive as archive_module
 from asgard.fus import client as client_module
 from asgard.fus import download, scheduling, streaming
 from asgard.fus.client import FUSClient
@@ -36,7 +39,18 @@ def encrypt(data):
 @pytest.fixture
 def server(monkeypatch):
     state = SimpleNamespace(
-        data=b"", requests=[], connections=set(), drops=0, throttles=0, throttle_status=429, bad_range=False
+        data=b"",
+        requests=[],
+        connections=set(),
+        drops=0,
+        throttles=0,
+        throttle_status=429,
+        bad_range=False,
+        auth_required=False,
+        authorized=False,
+        permanent_401=False,
+        nonce_requests=0,
+        init_requests=0,
     )
 
     class Handler(BaseHTTPRequestHandler):
@@ -55,6 +69,11 @@ def server(monkeypatch):
             start, end = map(int, re.fullmatch(r"bytes=(\d+)-(\d+)", self.headers["Range"]).groups())
             state.requests.append((start, end, time.monotonic()))
             state.connections.add(self.client_address)
+            if state.auth_required and not state.authorized:
+                self.send_response(401)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if state.throttles:
                 state.throttles -= 1
                 self.send_response(state.throttle_status)
@@ -79,10 +98,24 @@ def server(monkeypatch):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.send_response(200)
+            if self.path.endswith(FUSClient.GENERATE_NONCE_PATH):
+                state.nonce_requests += 1
+                self.send_header("NONCE", "0123456789ABCDEF")
+            elif self.path.endswith(FUSClient.BINARY_INIT_PATH):
+                state.init_requests += 1
+                state.authorized = bool(state.nonce_requests) and not state.permanent_401
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     monkeypatch.setattr(client_module, "_FUS_DOWNLOAD_URL", f"http://127.0.0.1:{httpd.server_port}/download")
+    monkeypatch.setattr(client_module, "_FUS_BASE_URL", f"http://127.0.0.1:{httpd.server_port}/")
+    monkeypatch.setattr(client_module, "_RETRY_BACKOFF_S", 0)
     monkeypatch.setattr(scheduling, "_DOWNLOAD_REQUEST_INTERVAL_S", 0)
     monkeypatch.setattr(scheduling, "_RATE_LIMIT_COOLDOWN_S", 0.02)
     monkeypatch.setattr(streaming, "_RETRY_BACKOFF_S", 0)
@@ -193,6 +226,107 @@ def test_remote_zip_entries_remain_valid(server):
         assert archive.read("stored.img") == plain
         assert archive.read("compressed.img") == plain
         assert archive.testzip() is None
+
+
+@pytest.mark.parametrize("compression", [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED])
+def test_large_tar_extraction_keeps_one_stream_without_refetching(server, compression):
+    members = {
+        "boot.img": b"boot" * 1024,
+        "super.img.lz4": random.Random(21).randbytes(12 * 1024 * 1024),
+        "vbmeta.img": b"meta" * 1024,
+    }
+    tar_buffer = io.BytesIO()
+    with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
+        for name, content in members.items():
+            entry = tarfile.TarInfo(name)
+            entry.size = len(content)
+            tar.addfile(entry, io.BytesIO(content))
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as archive:
+        archive.writestr("AP.tar.md5", tar_buffer.getvalue(), compress_type=compression)
+    server.data = encrypt(zip_buffer.getvalue())
+    received = []
+
+    with (
+        FUSClient() as client,
+        _FUSDecryptingReader(
+            client=client,
+            remote_path="test",
+            encrypted_size=len(server.data),
+            key=KEY,
+            stream_chunk_size=1024 * 1024,
+            network_progress=received.append,
+        ) as reader,
+        zipfile.ZipFile(reader) as archive,
+    ):
+        remote = archive_module._RemoteFirmwareArchive(
+            "SM-TEST",
+            "EUX",
+            BinaryInfo("", "test.zip.enc4", len(server.data), firmware_version="A/B/C/D"),
+            "A/B/C/D",
+            reader,
+            archive,
+        )
+        with archive_module._open_firmware_tar(remote, archive.getinfo("AP.tar.md5")) as tar:
+            for entry in tar:
+                with tar.extractfile(entry) as source:
+                    assert source.read() == members[entry.name]
+        assert len(server.requests) == 2
+        assert sum(received) == len(server.data)
+        reader.seek(512)
+        assert reader.read(32) == zip_buffer.getvalue()[512:544]
+        assert len(server.requests) == 3
+        assert sum(received) == len(server.data) + 65536
+
+
+@pytest.mark.parametrize("compression", [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED])
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_streamed_lz4_tar_member_preserves_data_and_validates_checksum(server, compression, corrupt):
+    plain = random.Random(22).randbytes(2 * 1024 * 1024) + bytes(1024 * 1024)
+    packed = lz4_frame.compress(plain, content_checksum=True)
+    if corrupt:
+        packed = packed[:-1] + bytes([packed[-1] ^ 1])
+    tar_buffer = io.BytesIO()
+    with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
+        entry = tarfile.TarInfo("super.img.lz4")
+        entry.size = len(packed)
+        tar.addfile(entry, io.BytesIO(packed))
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as archive:
+        archive.writestr("AP.tar.md5", tar_buffer.getvalue(), compress_type=compression)
+    server.data = encrypt(zip_buffer.getvalue())
+    received = []
+    with (
+        FUSClient() as client,
+        _FUSDecryptingReader(
+            client=client,
+            remote_path="test",
+            encrypted_size=len(server.data),
+            key=KEY,
+            stream_chunk_size=1024 * 1024,
+            network_progress=received.append,
+        ) as reader,
+        zipfile.ZipFile(reader) as archive,
+    ):
+        remote = archive_module._RemoteFirmwareArchive(
+            "SM-TEST",
+            "EUX",
+            BinaryInfo("", "test.zip.enc4", len(server.data), firmware_version="A/B/C/D"),
+            "A/B/C/D",
+            reader,
+            archive,
+        )
+        with archive_module._open_firmware_tar(remote, archive.getinfo("AP.tar.md5")) as tar:
+            with tar.extractfile(next(iter(tar))) as source:
+                output = io.BytesIO()
+                if corrupt:
+                    with pytest.raises(FUSError, match="could not decompress LZ4"):
+                        archive_module.copy_lz4_stream(source, output, label="test", keep_sparse=True)
+                else:
+                    archive_module.copy_lz4_stream(source, output, label="test", keep_sparse=True)
+                    assert output.getvalue() == plain
+                    assert len(server.requests) == 2
+                    assert sum(received) == len(server.data)
 
 
 def test_small_sequential_reads_use_a_long_stream(server):
@@ -364,6 +498,113 @@ def test_concurrent_unauthorized_requests_refresh_once(monkeypatch):
         results = list(pool.map(lambda _: client.download_file("test", start=0, end=15), range(4)))
     assert all(response.status_code == 206 for response in results)
     assert len(refreshes) == 1
+
+
+@pytest.mark.parametrize("mode", ["metadata", "stream", "parallel"])
+def test_expired_authorization_reinitializes_before_retry(server, tmp_path, mode):
+    plain = random.Random(16).randbytes(1024 * 1024)
+    server.data = encrypt(plain)
+    server.auth_required = True
+    with FUSClient() as client:
+
+        def recover():
+            client.refresh_auth()
+            client.make_request(FUSClient.BINARY_INIT_PATH, b"init")
+
+        if mode == "metadata":
+            result = _read_download_range(
+                client=client,
+                remote_path="test",
+                start=0,
+                end=len(server.data) - 1,
+                total_size=len(server.data),
+                recover_download=recover,
+            )
+            assert result == server.data
+        elif mode == "stream":
+            with _FUSDecryptingReader(
+                client=client, remote_path="test", encrypted_size=len(server.data), key=KEY, recover_download=recover
+            ) as reader:
+                assert reader.read() == plain
+        else:
+            path = tmp_path / "expired.part"
+            ranges, _ = _prepare_range_resume_state(path, len(server.data), False, part_count=1)
+            download._download_ranges_parallel(
+                client=client,
+                remote_path="test",
+                out_path=path,
+                total_size=len(server.data),
+                ranges=ranges,
+                workers=4,
+                recover_download=recover,
+            )
+            assert path.read_bytes() == server.data
+    assert server.nonce_requests == 1
+    assert server.init_requests == 1
+    assert sum(item[0] == server.requests[0][0] for item in server.requests) == 2
+
+
+def test_persistent_unauthorized_response_stops_without_transfer_retries(server):
+    server.data = bytes(65536)
+    server.auth_required = True
+    server.permanent_401 = True
+    with FUSClient() as client:
+
+        def recover():
+            client.refresh_auth()
+            client.make_request(FUSClient.BINARY_INIT_PATH, b"init")
+
+        with pytest.raises(FUSError, match="authorization failed after session recovery.*401"):
+            _read_download_range(
+                client=client, remote_path="test", start=0, end=65535, total_size=65536, recover_download=recover
+            )
+    assert len(server.requests) == 2
+    assert server.nonce_requests == 1
+    assert server.init_requests == 1
+
+
+def test_workers_share_nonce_refresh_and_download_initialization(monkeypatch):
+    barrier = threading.Barrier(4)
+    posts = []
+    initialized = threading.Event()
+
+    class Session:
+        def get(self, url, *, headers, **kwargs):
+            response = requests.Response()
+            response._content = b""
+            response._content_consumed = True
+            if "old" in headers["Authorization"]:
+                barrier.wait(timeout=2)
+                response.status_code = 401
+            else:
+                response.status_code = 206 if initialized.is_set() else 401
+            return response
+
+        def post(self, url, **kwargs):
+            posts.append(url.rsplit("/", 1)[-1])
+            response = requests.Response()
+            response.status_code = 200
+            response._content = b""
+            response._content_consumed = True
+            if url.endswith(FUSClient.GENERATE_NONCE_PATH):
+                response.headers["NONCE"] = "new"
+            elif url.endswith(FUSClient.BINARY_INIT_PATH):
+                initialized.set()
+            return response
+
+    monkeypatch.setattr(client_module, "_RETRY_BACKOFF_S", 0)
+    client = FUSClient(session=Session())
+    client.encnonce = "old"
+
+    def recover():
+        client.refresh_auth()
+        client.make_request(FUSClient.BINARY_INIT_PATH, b"init")
+
+    client.configure_download_recovery(recover)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: client.download_file("test", start=0, end=15), range(4)))
+    assert all(response.status_code == 206 for response in results)
+    assert posts == [FUSClient.GENERATE_NONCE_PATH, FUSClient.BINARY_INIT_PATH]
 
 
 def test_concurrency_probe_rejects_no_throughput_gain(monkeypatch):
