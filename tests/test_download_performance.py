@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import random
 import re
 import socket
+import struct
 import tarfile
 import threading
 import time
@@ -18,6 +20,8 @@ import requests
 from Cryptodome.Cipher import AES
 from lz4 import frame as lz4_frame
 
+from asgard import fus
+from asgard.cli.app import _build_parser, _handle_download
 from asgard.core.errors import FUSError
 from asgard.formats import archive as archive_module
 from asgard.fus import client as client_module
@@ -36,6 +40,31 @@ def encrypt(data):
     return AES.new(KEY, AES.MODE_ECB).encrypt(data + bytes([padding]) * padding)
 
 
+def super_image(plain):
+    data_offset = 5 * 4096
+    geometry = bytearray(4096)
+    struct.pack_into("<II32sIII", geometry, 0, 0x616C4467, 52, bytes(32), 4096, 1, 4096)
+    geometry[8:40] = hashlib.sha256(geometry[:52]).digest()
+    records = (
+        struct.pack("<36sIIII", b"vendor_a", 0, 0, 1, 0),
+        struct.pack("<QIQI", len(plain) // 512, 0, data_offset // 512, 0),
+        struct.pack("<36sIQ", b"default", 0, 0),
+        struct.pack("<QIIQ36sI", data_offset // 512, 4096, 0, data_offset + len(plain), b"super", 0),
+    )
+    tables = b"".join(records)
+    header = bytearray(128)
+    struct.pack_into(
+        "<IHHI32sI32s", header, 0, 0x414C5030, 10, 0, 128, bytes(32), len(tables), hashlib.sha256(tables).digest()
+    )
+    offset = 0
+    for index, record in enumerate(records):
+        struct.pack_into("<III", header, 80 + index * 12, offset, 1, len(record))
+        offset += len(record)
+    header[12:44] = hashlib.sha256(header).digest()
+    metadata = (header + tables).ljust(4096, b"\0")
+    return bytes(4096) + bytes(geometry) * 2 + bytes(metadata) * 2 + plain
+
+
 @pytest.fixture
 def server(monkeypatch):
     state = SimpleNamespace(
@@ -51,6 +80,14 @@ def server(monkeypatch):
         permanent_401=False,
         nonce_requests=0,
         init_requests=0,
+        lock=threading.Lock(),
+        active=0,
+        max_active=0,
+        completed=[],
+        chunk_delay=0,
+        first_range_delay=0,
+        stall=None,
+        stalled=threading.Event(),
     )
 
     class Handler(BaseHTTPRequestHandler):
@@ -94,9 +131,27 @@ def server(monkeypatch):
                 self.close_connection = True
                 return
             try:
-                self.wfile.write(memoryview(state.data)[start : end + 1])
+                with state.lock:
+                    state.active += 1
+                    state.max_active = max(state.max_active, state.active)
+                if start == 0:
+                    time.sleep(state.first_range_delay)
+                if state.stall is not None and end - start + 1 > 128 * 1024:
+                    state.stalled.set()
+                    state.stall.wait(5)
+                if state.chunk_delay:
+                    for offset in range(start, end + 1, 65536):
+                        time.sleep(state.chunk_delay)
+                        self.wfile.write(memoryview(state.data)[offset : min(end + 1, offset + 65536)])
+                        self.wfile.flush()
+                else:
+                    self.wfile.write(memoryview(state.data)[start : end + 1])
+                state.completed.append(start)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            finally:
+                with state.lock:
+                    state.active -= 1
 
         def do_POST(self):
             self.rfile.read(int(self.headers.get("Content-Length", "0")))
@@ -124,6 +179,8 @@ def server(monkeypatch):
     try:
         yield state
     finally:
+        if state.stall is not None:
+            state.stall.set()
         httpd.shutdown()
         httpd.server_close()
         thread.join()
@@ -226,6 +283,285 @@ def test_remote_zip_entries_remain_valid(server):
         assert archive.read("stored.img") == plain
         assert archive.read("compressed.img") == plain
         assert archive.testzip() is None
+
+
+@pytest.mark.parametrize("threads", [None, 1, 2, 6])
+def test_parallel_stream_delivers_out_of_order_ranges_in_order(server, monkeypatch, threads):
+    monkeypatch.setattr(streaming, "_DOWNLOAD_MIN_RANGE_SIZE", 256 * 1024)
+    plain = random.Random(30).randbytes(3 * 1024 * 1024 + 113)
+    server.data = encrypt(plain)
+    server.chunk_delay = 0.005
+    server.first_range_delay = 0.08
+    received = []
+    limited = []
+    limiter = BandwidthLimiter(None)
+    limiter.consume = lambda size, stop_event=None: limited.append(size)
+    with (
+        FUSClient() as client,
+        _FUSDecryptingReader(
+            client=client,
+            remote_path="test",
+            encrypted_size=len(server.data),
+            key=KEY,
+            threads=threads,
+            stream_chunk_size=65537,
+            network_progress=received.append,
+            rate_limiter=limiter,
+        ) as reader,
+    ):
+        with reader.streaming():
+            assert reader.read() == plain
+        assert sum(received) == len(server.data)
+        assert sum(limited) == len(server.data)
+        expected_workers = 6 if threads is None else threads
+        assert server.max_active == expected_workers
+        if expected_workers > 1:
+            assert server.completed.index(256 * 1024) < server.completed.index(0)
+        reader.seek(123)
+        assert reader.read(117) == plain[123:240]
+        reader.seek(-113, io.SEEK_END)
+        assert reader.read() == plain[-113:]
+        assert reader._gate.active == 0
+        assert not any(thread.name.startswith("asgard-range-") for thread in threading.enumerate())
+
+
+def test_parallel_stream_bounds_read_ahead_when_consumer_pauses(server, monkeypatch):
+    range_size = 256 * 1024
+    monkeypatch.setattr(streaming, "_DOWNLOAD_MIN_RANGE_SIZE", range_size)
+    plain = random.Random(31).randbytes(4 * 1024 * 1024)
+    server.data = encrypt(plain)
+    received = []
+    with (
+        FUSClient() as client,
+        _FUSDecryptingReader(
+            client=client,
+            remote_path="test",
+            encrypted_size=len(server.data),
+            key=KEY,
+            stream_chunk_size=65536,
+            network_progress=received.append,
+        ) as reader,
+    ):
+        with reader.streaming():
+            assert reader.read(16) == plain[:16]
+            deadline = time.monotonic() + 2
+            while sum(received) < 6 * range_size + 128 * 1024 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert sum(received) == 6 * range_size + 128 * 1024
+            count = len(server.requests)
+            time.sleep(0.1)
+            assert len(server.requests) == count == 7
+            reader.seek(2 * 1024 * 1024 + 13)
+            assert reader.read(16) == plain[2 * 1024 * 1024 + 13 : 2 * 1024 * 1024 + 29]
+        assert not any(thread.name.startswith("asgard-range-") for thread in threading.enumerate())
+
+
+def test_parallel_stream_resumes_partial_ranges_without_refetching(server, monkeypatch):
+    monkeypatch.setattr(streaming, "_DOWNLOAD_MIN_RANGE_SIZE", 256 * 1024)
+    plain = random.Random(32).randbytes(2 * 1024 * 1024)
+    server.data = encrypt(plain)
+    received = []
+    with (
+        FUSClient() as client,
+        _FUSDecryptingReader(
+            client=client,
+            remote_path="test",
+            encrypted_size=len(server.data),
+            key=KEY,
+            stream_chunk_size=65537,
+            network_progress=received.append,
+        ) as reader,
+    ):
+        server.drops = 1
+        with reader.streaming():
+            assert reader.read() == plain
+        starts = [start for start, _, _ in server.requests]
+        assert any(start % (256 * 1024) == 65537 for start in starts)
+        assert sum(received) == len(server.data)
+
+
+def test_parallel_stream_cancels_stalled_connections(server, monkeypatch):
+    monkeypatch.setattr(streaming, "_DOWNLOAD_MIN_RANGE_SIZE", 256 * 1024)
+    server.data = encrypt(random.Random(33).randbytes(2 * 1024 * 1024))
+    with FUSClient() as client:
+        reader = _FUSDecryptingReader(client=client, remote_path="test", encrypted_size=len(server.data), key=KEY)
+        server.stall = threading.Event()
+        reader._streaming_reads = True
+        reader._open_stream()
+        assert server.stalled.wait(2)
+        deadline = time.monotonic() + 2
+        while len(server.requests) < 7 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        started = time.monotonic()
+        reader.close()
+        assert time.monotonic() - started < 1.5
+        assert reader._gate.active == 0
+        assert not any(thread.name.startswith("asgard-range-") for thread in threading.enumerate())
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_parallel_stream_honors_shared_throttle_cooldown(server, monkeypatch, status):
+    monkeypatch.setattr(streaming, "_DOWNLOAD_MIN_RANGE_SIZE", 256 * 1024)
+    monkeypatch.setattr(scheduling, "_DOWNLOAD_REQUEST_INTERVAL_S", 0.025)
+    plain = random.Random(34).randbytes(2 * 1024 * 1024)
+    server.data = encrypt(plain)
+    with (
+        FUSClient() as client,
+        _FUSDecryptingReader(client=client, remote_path="test", encrypted_size=len(server.data), key=KEY) as reader,
+    ):
+        server.throttles = 1
+        server.throttle_status = status
+        with reader.streaming():
+            assert reader.read() == plain
+        assert server.requests[2][2] - server.requests[1][2] >= 0.07
+        assert reader._gate.limit == 3
+
+
+def test_default_gate_allows_six_concurrent_connections(server):
+    gate = AdaptiveDownloadGate(6)
+    stop = threading.Event()
+    for _ in range(6):
+        assert gate.acquire(stop)
+    assert gate.active == gate.limit == 6
+    gate.throttled(0.08)
+    assert gate.limit == 3
+    for _ in range(6):
+        gate.release()
+
+
+@pytest.mark.parametrize("compression", [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED])
+@pytest.mark.parametrize("mode", ["archive", "file", "partition"])
+@pytest.mark.parametrize("threads", [None, 2])
+def test_archive_extraction_api_uses_requested_connections(server, tmp_path, monkeypatch, compression, mode, threads):
+    monkeypatch.setattr(streaming, "_DOWNLOAD_MIN_RANGE_SIZE", 256 * 1024)
+    plain = random.Random(35).randbytes(3 * 1024 * 1024)
+    member_name = "super.img.lz4" if mode == "partition" else "boot.img.lz4"
+    compressed = lz4_frame.compress(super_image(plain) if mode == "partition" else plain, content_checksum=True)
+    tar_buffer = io.BytesIO()
+    with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
+        entry = tarfile.TarInfo(member_name)
+        entry.size = len(compressed)
+        tar.addfile(entry, io.BytesIO(compressed))
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as archive:
+        archive.writestr("AP_test.tar.md5", tar_buffer.getvalue(), compress_type=compression)
+    server.data = encrypt(zip_buffer.getvalue())
+    server.chunk_delay = 0.005
+    info = BinaryInfo("", "test.zip.enc4", len(server.data), firmware_version="A/B/C/D")
+    monkeypatch.setattr(fus, "_resolve_versioned_info", lambda *args: info)
+    monkeypatch.setattr(fus, "initialize_download", lambda *args: None)
+    monkeypatch.setattr(fus, "_decryption_key_from_info", lambda *args: KEY)
+    monkeypatch.setattr(archive_module, "_load_tar_index", lambda *args: None)
+    if mode == "archive":
+        paths = archive_module.download_firmware_entries(
+            model="SM-TEST", region="EUX", selectors=("AP",), out_dir=tmp_path, threads=threads
+        )
+        assert paths[0].read_bytes() == tar_buffer.getvalue()
+    elif mode == "file":
+        path = archive_module.download_firmware_tar_member(
+            model="SM-TEST",
+            region="EUX",
+            outer_selector="AP",
+            member_name="boot.img.lz4",
+            out_dir=tmp_path,
+            threads=threads,
+        )
+        assert path.read_bytes() == plain
+    else:
+        paths = archive_module.download_firmware_super_partitions(
+            model="SM-TEST",
+            region="EUX",
+            outer_selector="AP",
+            partitions=("vendor_a",),
+            output=tmp_path,
+            threads=threads,
+        )
+        assert paths[0].read_bytes() == plain
+    assert server.max_active == (6 if threads is None else threads)
+    assert not list(tmp_path.glob("*.part"))
+    assert not any(thread.name.startswith("asgard-range-") for thread in threading.enumerate())
+
+
+def test_parallel_extraction_recovers_expired_auth_once(server, monkeypatch):
+    monkeypatch.setattr(streaming, "_DOWNLOAD_MIN_RANGE_SIZE", 256 * 1024)
+    plain = random.Random(36).randbytes(2 * 1024 * 1024)
+    server.data = encrypt(plain)
+    with FUSClient() as client:
+
+        def recover():
+            client.refresh_auth()
+            client.make_request(FUSClient.BINARY_INIT_PATH, b"init")
+
+        with _FUSDecryptingReader(
+            client=client, remote_path="test", encrypted_size=len(server.data), key=KEY, recover_download=recover
+        ) as reader:
+            server.auth_required = True
+            with reader.streaming():
+                assert reader.read() == plain
+    assert server.nonce_requests == server.init_requests == 1
+
+
+def test_small_archive_extraction_does_not_prefetch_the_following_archive(server, tmp_path, monkeypatch):
+    monkeypatch.setattr(streaming, "_DOWNLOAD_MIN_RANGE_SIZE", 256 * 1024)
+    plain = random.Random(38).randbytes(65536)
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as archive:
+        archive.writestr("BL_test.tar.md5", plain)
+        archive.writestr("AP_test.tar.md5", random.Random(39).randbytes(3 * 1024 * 1024))
+    server.data = encrypt(zip_buffer.getvalue())
+    info = BinaryInfo("", "test.zip.enc4", len(server.data), firmware_version="A/B/C/D")
+    monkeypatch.setattr(fus, "_resolve_versioned_info", lambda *args: info)
+    monkeypatch.setattr(fus, "initialize_download", lambda *args: None)
+    monkeypatch.setattr(fus, "_decryption_key_from_info", lambda *args: KEY)
+    paths = archive_module.download_firmware_entries(model="SM-TEST", region="EUX", selectors=("BL",), out_dir=tmp_path)
+    assert paths[0].read_bytes() == plain
+    assert sum(end - start + 1 for start, end, _ in server.requests) <= 128 * 1024 + len(plain) + 132 * 1024
+
+
+def test_parallel_extraction_rejects_wrong_ranges_and_closes_connections(server, monkeypatch):
+    monkeypatch.setattr(streaming, "_DOWNLOAD_MIN_RANGE_SIZE", 256 * 1024)
+    monkeypatch.setattr(streaming, "_DOWNLOAD_RETRIES", 1)
+    server.data = encrypt(random.Random(37).randbytes(2 * 1024 * 1024))
+    with (
+        FUSClient() as client,
+        _FUSDecryptingReader(client=client, remote_path="test", encrypted_size=len(server.data), key=KEY) as reader,
+    ):
+        server.bad_range = True
+        with pytest.raises(FUSError, match="wrong byte range"), reader.streaming():
+            reader.read()
+        assert reader._gate.active == 0
+        assert not any(thread.name.startswith("asgard-range-") for thread in threading.enumerate())
+
+
+@pytest.mark.parametrize(
+    ("options", "function", "single_output"),
+    [
+        ([], "download_firmware_entries", False),
+        (["--file", "boot.img.lz4"], "download_firmware_tar_member", True),
+        (["--partition", "vendor_a"], "download_firmware_super_partitions", False),
+        (["--partition", "vendor_a", "--path", "/vendor_a/etc/build.prop"], "download_firmware_partition_files", False),
+        (["--list-entries"], "iter_firmware_tar_entries", False),
+        (["--list-partitions"], "iter_firmware_super_partitions", False),
+    ],
+)
+def test_cli_thread_override_reaches_extraction(tmp_path, monkeypatch, options, function, single_output):
+    captured = {}
+    destination = tmp_path / "result.img"
+
+    def extract(**kwargs):
+        captured.update(kwargs)
+        if single_output:
+            return destination
+        return () if options and options[0].startswith("--list") else (destination,)
+
+    monkeypatch.setattr(archive_module, function, extract)
+    parser = _build_parser()
+    output_options = [] if options and options[0].startswith("--list") else ["-o", str(tmp_path)]
+    args = parser.parse_args(
+        ["download", "SM-TEST", "EUX", "--archive", "AP", "--threads", "3", "--json"] + output_options + options
+    )
+    assert _handle_download(args, parser) == 0
+    assert captured["threads"] == 3
 
 
 @pytest.mark.parametrize("compression", [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED])
@@ -374,8 +710,11 @@ def test_tail_reads_and_cache_hits_respect_the_bandwidth_limit(server):
 
 @pytest.mark.parametrize("decrypt", [False, True])
 def test_full_download_api(server, tmp_path, monkeypatch, decrypt):
-    plain = random.Random(14).randbytes(1024 * 1024)
+    monkeypatch.setattr(scheduling, "_DOWNLOAD_MIN_RANGE_SIZE", 256 * 1024)
+    monkeypatch.setattr(download, "_DOWNLOAD_CHUNK_SIZE", 65536)
+    plain = random.Random(14).randbytes(3 * 1024 * 1024)
     server.data = encrypt(plain)
+    server.chunk_delay = 0.005
     info = BinaryInfo("/test/", "test.zip.enc4", len(server.data), firmware_version="A/B/C/D")
     monkeypatch.setattr(download, "_resolve_versioned_info", lambda *args: info)
     monkeypatch.setattr(download, "initialize_download", lambda *args: None)
@@ -385,6 +724,7 @@ def test_full_download_api(server, tmp_path, monkeypatch, decrypt):
     path = result.decrypted_path if decrypt else result.encrypted_path
     assert path.read_bytes() == (plain if decrypt else server.data)
     assert not list(tmp_path.glob("*.resume.json"))
+    assert server.max_active == 6
 
 
 def test_metadata_retry_preserves_received_bytes(server):
@@ -611,7 +951,7 @@ def test_concurrency_probe_rejects_no_throughput_gain(monkeypatch):
     clock = [100.0]
     monkeypatch.setattr(scheduling.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(scheduling, "_DOWNLOAD_REQUEST_INTERVAL_S", 0)
-    gate = AdaptiveDownloadGate(4)
+    gate = AdaptiveDownloadGate(4, initial_workers=1)
     stop = threading.Event()
     assert gate.acquire(stop)
     assert gate.limit == 1
@@ -647,7 +987,7 @@ def test_concurrency_grows_when_more_streams_improve_speed(monkeypatch):
     clock = [100.0]
     monkeypatch.setattr(scheduling.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(scheduling, "_DOWNLOAD_REQUEST_INTERVAL_S", 0)
-    gate = AdaptiveDownloadGate(4)
+    gate = AdaptiveDownloadGate(4, initial_workers=1)
     stop = threading.Event()
     assert gate.acquire(stop)
     acquired = [threading.Event(), threading.Event()]

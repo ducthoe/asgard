@@ -18,13 +18,11 @@ from ..core.resources import download_worker_count
 
 
 class AdaptiveDownloadGate:
-    """Probe for useful concurrency and make throttled workers cool down together."""
-
-    def __init__(self, max_workers: int):
+    def __init__(self, max_workers: int, *, initial_workers: int | None = None):
         if max_workers <= 0:
             raise ValueError("threads must be positive")
         self.max_workers = max_workers
-        self.limit = 1
+        self.limit = max_workers if initial_workers is None else max(1, min(max_workers, initial_workers))
         self.active = 0
         self._condition = threading.Condition()
         self._cooldown_until = 0.0

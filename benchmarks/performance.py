@@ -150,11 +150,101 @@ def image_benchmark():
     return results
 
 
+def parallel_stream_benchmark(size_mib=96, mib_per_second=16):
+    key = bytes(range(16))
+    plain = random.Random(31).randbytes(size_mib * 1024 * 1024)
+    expected_digest = hashlib.sha256(plain).hexdigest()
+    encrypted = AES.new(key, AES.MODE_ECB).encrypt(plain + bytes([16]) * 16)
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def handle(self):
+            try:
+                super().handle()
+            except ConnectionResetError:
+                pass
+
+        def do_GET(self):
+            nonlocal active, max_active
+            start, end = map(int, re.fullmatch(r"bytes=(\d+)-(\d+)", self.headers["Range"]).groups())
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(encrypted)}")
+            self.send_header("Content-Length", str(end - start + 1))
+            self.end_headers()
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                deadline = time.perf_counter()
+                for offset in range(start, end + 1, 65536):
+                    chunk = memoryview(encrypted)[offset : min(end + 1, offset + 65536)]
+                    deadline += len(chunk) / (mib_per_second * 1024 * 1024)
+                    time.sleep(max(0, deadline - time.perf_counter()))
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                with lock:
+                    active -= 1
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    original_url = client_module._FUS_DOWNLOAD_URL
+    client_module._FUS_DOWNLOAD_URL = f"http://127.0.0.1:{server.server_port}/download"
+    results = {"source": "local HTTP server", "per_connection_mib_s": mib_per_second, "size_mib": size_mib}
+    try:
+        for workers in (1, 6):
+            max_active = 0
+            digest = hashlib.sha256()
+            started = time.perf_counter()
+            with (
+                FUSClient() as client,
+                _FUSDecryptingReader(
+                    client=client,
+                    remote_path="benchmark",
+                    encrypted_size=len(encrypted),
+                    key=key,
+                    stream_chunk_size=1024 * 1024,
+                    threads=workers,
+                ) as reader,
+                reader.streaming(),
+            ):
+                while chunk := reader.read(1024 * 1024):
+                    digest.update(chunk)
+            elapsed = time.perf_counter() - started
+            assert digest.hexdigest() == expected_digest
+            results[f"{workers}_connections"] = {
+                "seconds": round(elapsed, 3),
+                "ordered_mib_s": round(size_mib / elapsed, 2),
+                "max_active": max_active,
+                "sha256": digest.hexdigest(),
+            }
+    finally:
+        client_module._FUS_DOWNLOAD_URL = original_url
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline", default="HEAD")
     parser.add_argument("--latency-ms", default=50.0, type=float)
+    parser.add_argument("--parallel-stream-only", action="store_true")
     args = parser.parse_args()
+    if args.parallel_stream_only:
+        print(json.dumps(parallel_stream_benchmark(), indent=2))
+        return
     constants = load_baseline("asgard/core/constants.py", args.baseline)
     old_streaming = load_baseline("asgard/fus/streaming.py", args.baseline, constants)
     old_scheduling = load_baseline("asgard/fus/scheduling.py", args.baseline, constants)
@@ -162,6 +252,7 @@ def main():
     results = {
         "remote_metadata": metadata_benchmark(old_streaming._FUSDecryptingReader, args.latency_ms / 1000),
         "ext4_extraction": image_benchmark(),
+        "ordered_parallel_stream": parallel_stream_benchmark(),
         "12_gib_download_requests": {
             "before": len(old_scheduling.split_download_ranges(ranges, workers=4)),
             "after": len(split_download_ranges(ranges, workers=4)),

@@ -170,6 +170,7 @@ def _download_sources(
     resume: bool,
     timeout_s: int,
     rate_limit: int | None,
+    threads: int | None = None,
     preferred_archives: tuple[str, ...] = (),
     source_cache: Path | None = None,
 ) -> dict[str, Path]:
@@ -181,6 +182,7 @@ def _download_sources(
         "firmware_version": firmware_version,
         "timeout_s": timeout_s,
         "rate_limit": rate_limit,
+        "threads": threads,
     }
     pending = {
         name: {path.name for path in _candidate_paths(Path("."), name, member)}

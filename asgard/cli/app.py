@@ -208,7 +208,7 @@ def _add_network_options(parser: argparse.ArgumentParser, *, threads: bool = Fal
     )
     parser.add_argument("--limit-rate", type=_parse_byte_rate, metavar="RATE", help="Aggregate limit, e.g. 10M")
     if threads:
-        parser.add_argument("--threads", type=_positive_int, help="Override automatic download or decrypt workers")
+        parser.add_argument("--threads", type=_positive_int, help="Download connections (default: 6) or decrypt workers")
 
 
 def _add_manifest_option(parser: argparse.ArgumentParser) -> None:
@@ -620,6 +620,7 @@ def _handle_download(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         "firmware_version": args.firmware,
         "timeout_s": args.timeout,
         "rate_limit": args.limit_rate,
+        "threads": args.threads,
     }
     if args.ota:
         incompatible = any(
@@ -703,6 +704,7 @@ def _handle_download(args: argparse.Namespace, parser: argparse.ArgumentParser) 
             force=args.ota_force,
             timeout_s=args.timeout,
             rate_limit=args.limit_rate,
+            threads=args.threads,
         )
         paths = list(result.paths)
         payload = result.to_dict()

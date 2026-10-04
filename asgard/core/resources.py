@@ -10,8 +10,6 @@ import sys
 from contextlib import suppress
 from pathlib import Path
 
-from .constants import _DOWNLOAD_MIN_RANGE_SIZE
-
 _MIB = 1024 * 1024
 
 
@@ -110,13 +108,7 @@ def available_memory() -> int | None:
 
 
 def download_worker_count(total_size: int | None = None) -> int:
-    workers = min(4, max(1, (available_cpu_count() + 1) // 2))
-    memory = available_memory()
-    if memory is not None:
-        workers = min(workers, max(1, memory // (16 * _MIB)))
-    if total_size is not None and total_size > 0:
-        workers = min(workers, max(1, (total_size + _DOWNLOAD_MIN_RANGE_SIZE - 1) // _DOWNLOAD_MIN_RANGE_SIZE))
-    return max(1, workers)
+    return 6
 
 
 def decrypt_worker_count() -> int:

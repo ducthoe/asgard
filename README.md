@@ -5,370 +5,338 @@ SPDX-License-Identifier: GPL-3.0-only
 
 # Asgard
 
-Asgard is a command-line tool for getting Samsung firmware from the Firmware
-Update Server (FUS). You can check what is available, download and decrypt a
-package, or pull out the files and partitions you need without downloading the
-whole thing.
+Asgard downloads Samsung firmware from the Firmware Update Server (FUS).
+Use it to check releases, download and decrypt a package, or extract an archive,
+image, logical partition, or file inside a partition.
 
-It can also combine an over-the-air (OTA) update with its base firmware to
-produce updated images, check local files, and write JSON manifests. Most
-commands can return JSON if you want to use Asgard in a script.
+It also applies OTA updates to base firmware and checks local packages and
+images. Most commands support JSON output for scripts.
 
 ## Install
+
+Requires Python 3.10 or newer.
 
 ```console
 python3 -m pip install asgard-fus
 asgard --help
 ```
 
-## Start here
+Use a virtual environment if your Python installation blocks package installs.
+Run `asgard COMMAND --help` for that command's options.
 
-You will usually need a device model and a CSC (region or carrier code). For
-example, `SM-S721B` and `EUX`:
+## Check a release and download it
+
+You need a device model and a CSC, the region or carrier code. Replace the
+example codes below with your device's codes, such as `SM-A566B` and `EUX`.
 
 ```console
-asgard checkupdate SM-S721B EUX
-asgard download SM-S721B EUX --decrypt --resume --output ./downloads
+asgard checkupdate SM-A566B EUX
+asgard download SM-A566B EUX --decrypt --resume -o ./downloads
 ```
 
-The first command checks the latest version. The second downloads it, decrypts
-it, and saves it in `./downloads`. If the transfer stops, run the same download
-command again with `--resume`.
+The download command decrypts the package as it arrives and saves a ZIP in
+`./downloads`. If the transfer stops, run the same command again to resume.
+Omit `--decrypt` to keep the encrypted package.
 
-Run `asgard COMMAND --help` whenever you need the full list of options for a
-command.
-
-## Find a firmware version
-
-Check the latest release, browse older releases, or compare the release
-histories of two CSCs:
+Browse release history or compare two CSCs:
 
 ```console
-asgard checkupdate SM-S721B EUX
 asgard history SM-S721B EUX
-asgard compare SM-S721B EUX ZTO
+asgard compare SM-S721B EUX ZTO --json
 ```
 
-`history` and `compare` also support `--json`. With `compare`, use
-`--firmware-a` and `--firmware-b` if you want to compare specific releases
-instead of the latest ones.
-
-## Download firmware
-
-Without `--decrypt`, Asgard saves the encrypted package. Add `--decrypt` to
-get a decrypted ZIP in the same run:
+To choose an older release, copy its full four-part version from `history` and
+pass it with `--firmware`. For example:
 
 ```console
-asgard download SM-S721B EUX --output ./downloads --resume
-asgard download SM-S721B EUX --decrypt --output ./downloads --resume
+asgard download SM-A566B EUX \
+  --firmware A566BXXSECZI2/A566BOXMECZI2/A566BXXSECZI2/A566BXXSECZI2 \
+  --decrypt --resume -o ./downloads
 ```
 
-To download an older release, pass its full firmware version:
+`compare` accepts `--firmware-a` and `--firmware-b` to compare specific releases.
+
+## Extract an archive or image
+
+List the package's archives, then inspect the files inside AP:
 
 ```console
-asgard download SM-S721B EUX \
-  --firmware S721BXXSACZB2/S721BOXMACZB2/S721BXXSACZB2/S721BXXSACZB2 \
-  --output ./downloads
+asgard download SM-A566B EUX --list-entries
+asgard download SM-A566B EUX --archive AP --list-entries
 ```
 
-Downloads use a small number of workers by default: at most four for a large
-file, and fewer when the file or system is smaller. Asgard starts with one
-active stream and measures transfer speed before adding another. It keeps
-additional concurrency when aggregate throughput improves by at least 10%.
-Requests are briefly spaced apart, and larger ranges reduce request overhead.
-After HTTP 429 or 503 responses, workers share a cooldown and reduce concurrency.
-When the server sends `Retry-After`, Asgard follows it.
-You can set your own worker limit with `--threads N`, though a high value may
-slow a download or trigger more rate limits.
+Select an archive by name or a quoted glob pattern:
 
-Useful download options:
+```console
+asgard download SM-A566B EUX --archive BL -o ./downloads --resume
+asgard download SM-A566B EUX --archive '*.zip' -o ./downloads --resume
+```
 
-| Option | What it does |
+To extract a file from AP:
+
+```console
+asgard download SM-A566B EUX \
+  --archive AP --file super.img.lz4 -o ./images
+```
+
+Asgard decompresses LZ4 members and expands Android sparse images. Add
+`--keep-sparse` to retain the Android sparse form. Archive and image extraction
+already decrypt the incoming data, so these commands do not need `--decrypt`.
+
+## Extract logical partitions
+
+List the partitions in `super.img` or `super.img.lz4`:
+
+```console
+asgard download SM-A566B EUX --archive AP --list-partitions
+```
+
+Use the names from that list to select partitions. Repeat `--partition` to
+extract several in one pass:
+
+```console
+asgard download SM-A566B EUX \
+  --archive AP --partition system_a --partition vendor_a -o ./images
+```
+
+The command writes `system_a.img` and `vendor_a.img`. To extract every logical
+partition:
+
+```console
+asgard download SM-A566B EUX --archive AP --unpack-super -o ./images
+```
+
+Asgard reads compressed data in order. Reaching a partition near the end of a
+super image can require downloading and decoding the data before it. A small
+output does not necessarily mean a small transfer.
+
+Without `--resume`, partition extraction streams the source without saving a
+local copy. With `--resume`, Asgard caches the source stream on disk before
+extracting partitions, so it can reuse that data after an interruption.
+
+## Read files inside partitions
+
+Use `--path` with a full device path. Repeat it to extract several files:
+
+```console
+asgard download SM-A566E SER --archive AP \
+  --path /system/build.prop --path /vendor/build.prop -o ./files
+```
+
+This writes `./files/system/build.prop` and `./files/vendor/build.prop` without
+saving the decoded partition images. Finding the image in a compressed AP
+archive can still require downloading earlier archive data.
+
+Asgard reads ext4, F2FS, and EROFS filesystems, including chunked and
+LZ4-compressed EROFS files. It handles system-as-root layouts and resolves
+unsuffixed partition paths against slot A, then slot B, when needed. It reports
+an error for unsupported filesystem features, encrypted files, or multi-device
+images.
+
+## Transfer speed and resuming
+
+Downloads use up to six connections by default, including archive, image,
+partition, and OTA base-image extraction. `--threads N` changes this limit;
+use `--threads 1` for a single connection. Small transfers and metadata reads
+use fewer connections.
+
+Extraction fetches separate byte ranges in parallel and delivers them in order
+to the decoder. Each connection can buffer up to 16 MiB ahead, so the default
+network buffer holds at most 96 MiB. ZIP decoding, LZ4 decoding, and partition
+copying can overlap through buffered worker threads.
+
+HTTP 429 or 503 responses reduce concurrency. Workers share the cooldown and
+honor `Retry-After`. After the cooldown, Asgard increases concurrency when
+measured aggregate throughput improves.
+
+| Option | Use |
 | --- | --- |
-| `--resume` | Continues an interrupted download or extraction. |
-| `--threads N` | Sets the worker limit for downloading or decrypting. |
-| `--timeout SECONDS` | Sets the network request timeout. |
-| `--limit-rate RATE` | Caps total transfer speed, for example `500K`, `10M`, or `1GiB`. |
-| `--quiet` | Hides progress and informational output. |
-| `--json` | Writes machine-readable output. |
+| `--resume` | Continue an interrupted package download or reuse extraction staging. |
+| `--threads N` | Set download connections for all modes, or workers for local decryption. |
+| `--timeout SECONDS` | Set the network request timeout. |
+| `--limit-rate RATE` | Cap total transfer speed, for example `500K`, `10M`, or `1GiB`. |
+| `--quiet` | Hide progress and informational output. |
+| `--json` | Write machine-readable output. |
 
-You can change `--threads` between resumed runs. Keep both the partial data
-file and its `.resume.json` file; Asgard needs them to continue the download.
+For a resumed package download, keep both the partial data file and its
+`.resume.json` file. You can change `--threads` between runs.
 
-## Get files from a package
-
-You can inspect a remote package before deciding what to download:
-
-```console
-asgard download SM-S721B EUX --list-entries
-asgard download SM-S721B EUX --archive AP --list-entries
-```
-
-The first command lists the package's archives. The second lists files inside
-the AP archive. To download an archive, choose it by name or with a quoted glob
-pattern:
-
-```console
-asgard download SM-S721B EUX --archive BL --output ./downloads --resume
-asgard download SM-S721B EUX --archive '*.zip' --output ./downloads --resume
-```
-
-You can also extract one file directly:
-
-```console
-asgard download SM-S721B EUX \
-  --archive AP --file super.img.lz4 \
-  --output ./downloads --resume
-```
-
-Asgard decodes LZ4 compression and Android sparse images during extraction.
-Add `--keep-sparse` if you want the Android sparse form of an image:
-
-```console
-asgard download SM-S721B EUX \
-  --archive AP --file super.img.lz4 --keep-sparse \
-  --output ./downloads --resume
-```
-
-### Logical partitions in a super image
-
-List the partitions first, then extract the ones you want:
-
-```console
-asgard download SM-S721B EUX --archive AP --list-partitions
-asgard download SM-S721B EUX \
-  --archive AP --partition system --partition vendor \
-  --output ./downloads --resume
-```
-
-Use `--unpack-super` to extract every logical partition:
-
-```console
-asgard download SM-S721B EUX \
-  --archive AP --unpack-super --output ./downloads --resume
-```
-
-To download only a file inside a partition, give its full device path with
-`--path`. Asgard stops scanning the AP archive when it finds an image that can
-supply the requested partition. It reads filesystem data in memory and writes
-only the requested file to the output directory:
-
-```console
-asgard download SM-A566E SER --archive AP \
-  --path /system/build.prop --output ./files
-asgard download SM-A566E SER --archive AP \
-  --path /vendor/build.prop --output ./files
-```
-
-If the AP TAR is compressed inside the firmware ZIP, finding the image can
-still require downloading earlier compressed archive data. The partition image
-is not saved to disk. System images that keep their files inside a `system/`
-directory are handled as well.
-
-These commands save `./files/system/build.prop` and
-`./files/vendor/build.prop`. You can repeat `--path` for more files, such as
-`--path /vendor/etc/build.prop`. The reader handles EROFS,
-F2FS, and ext4 images, including chunked and LZ4-compressed EROFS files. Some
-newer filesystem features, encrypted files, and multi-device images are not
-supported; Asgard reports an error if it encounters one.
-
-You can also request both files in one download by repeating `--path`:
-
-```console
-asgard download SM-A566E SER --archive AP \
-  --path /system/build.prop --path /vendor/build.prop --output ./files
-```
-
-For A/B firmware, `/system/build.prop` also works when the image is named
-`system_a.img` or the logical partition is `system_a`. Asgard tries the
-unsuffixed partition first, then slot A, then slot B.
-
-For resumed extraction, Asgard keeps the source stream locally so it can
-rebuild decoded output without fetching the same source data again.
-
-Remote reads cache up to 8 MiB of decrypted data in memory. Small metadata
-lookups fetch 64 KiB blocks and reuse connections; sequential reads switch
-to a continuous stream. Interrupted range requests retain bytes already
-received. Ext4 and uncompressed EROFS files are extracted in batches of up
-to 1 MiB.
+Remote readers cache recently decrypted data, fetch bounded blocks for metadata,
+and fetch sequential extraction data through ordered ranges. Transfer speed also
+depends on the CDN connection and network route; increasing the worker limit
+does not guarantee a faster download.
 
 ## Apply an OTA update
 
-Give Asgard an OTA ZIP and the model and CSC of its base firmware:
-
-```console
-asgard download SM-S938U VZW --ota update.zip --output ./updated
-```
-
-Asgard reads the OTA, finds the matching base release in firmware history, and
-downloads the base images it needs from FUS. If the history does not give a
-single full version, pass the four-part version with `--firmware`. You can also
-provide local base images with `--ota-base-dir DIR` or by repeating
-`--ota-base-image PARTITION=PATH`. Local raw images stay unchanged; LZ4 and
-Android sparse inputs are decoded as needed. For slotted images, Asgard prefers
-the `_a` base unless you supply an image explicitly.
-
-By default, Asgard produces every partition and full image in the OTA. Use
-these commands to see the targets and choose only the ones you need:
+Inspect an OTA ZIP and its targets:
 
 ```console
 asgard ota-info update.zip
 asgard download SM-S938U VZW --ota update.zip --ota-list-targets
-asgard download SM-S938U VZW --ota update.zip \
-  --ota-partition 'system,vendor' --output ./updated
-asgard download SM-S908B EUX --ota update.zip \
-  --ota-file 'vbmeta*' --output ./updated
 ```
 
-`--ota-partition` and `--ota-file` can be repeated. They accept comma-separated
-names and quoted glob patterns. Once you select a target, Asgard produces only
-matching targets. A full-replacement target needs no base image.
-
-Asgard writes downloaded base images into the merge output. Add
-`--ota-keep-base` if you want separate copies of those bases. `--resume` can
-reuse finished outputs, but an interrupted patch starts again from its base
-image. Asgard does not build an Odin package or flash a device.
-
-OTA work uses one worker when available memory cannot be measured. Otherwise,
-the default scales with available CPUs and memory, allowing roughly 768 MiB
-per worker. Use `--ota-jobs N` to set a limit yourself. Full-image block patches
-and safe A/B source copies stream in bounded chunks; overlapping in-place
-operations may still need source buffers. Asgard streams compressed firmware
-packages and super images without staging them to disk.
-
-Asgard checks patch source data, available target hashes, and ZIP contents.
-`--ota-force` lets you replace existing outputs or override the declared base
-version. Source hash checks still run unless you add `--ota-no-verify`.
-OTA signing certificates are not authenticated.
-
-Supported A/B payload operations are REPLACE, REPLACE_BZ, REPLACE_XZ,
-SOURCE_COPY, SOURCE_BSDIFF, BROTLI_BSDIFF, ZERO, and DISCARD. Block OTAs
-support BSDIFF patches and move, new, zero, erase, stash, and free commands.
-Asgard rejects unsupported operations and payloads that need generated
-verity/FEC data before downloading base images.
-
-## Decrypt a package you already have
+Apply it to the matching base firmware, or select only the targets you need:
 
 ```console
-asgard decrypt SM-S721B EUX ./firmware.zip.enc4 \
+asgard download SM-S938U VZW --ota update.zip -o ./updated
+asgard download SM-S938U VZW --ota update.zip \
+  --ota-partition 'system,vendor' -o ./updated
+asgard download SM-S908B EUX --ota update.zip \
+  --ota-file 'vbmeta*' -o ./updated
+```
+
+Asgard finds the base release in FUS history and downloads the images it needs.
+Pass `--firmware` if it cannot resolve a single full base version. To supply
+local bases, use `--ota-base-dir DIR` or repeat
+`--ota-base-image PARTITION=PATH`. For slotted images, Asgard prefers the `_a`
+base unless you supply an explicit image. It leaves local raw base images
+unchanged and decodes LZ4 or sparse inputs as needed.
+
+`--ota-partition` and `--ota-file` accept comma-separated names and quoted glob
+patterns. Repeat either option for more selectors. With no selectors, Asgard
+produces every partition and full image in the OTA. Full-replacement targets
+need no base image.
+
+Downloaded base images become the merge output. Use `--ota-keep-base` to retain
+separate copies. `--resume` reuses finished outputs, but an interrupted patch
+starts again from its base. Asgard produces images; it does not create an Odin
+package or flash a device.
+
+The default OTA worker limit scales with available CPUs and memory, allowing
+roughly 768 MiB per worker. It uses one worker when it cannot measure memory.
+Set `--ota-jobs N` to choose a limit. Operations stream in bounded chunks where
+possible; overlapping in-place operations can need source buffers.
+
+Asgard checks source data, available target hashes, and ZIP contents. Use
+`--ota-force` to replace outputs or override the declared base version.
+`--ota-no-verify` disables source and target hash checks. Asgard does not
+authenticate OTA signing certificates.
+
+A/B payloads support REPLACE, REPLACE_BZ, REPLACE_XZ, SOURCE_COPY,
+SOURCE_BSDIFF, BROTLI_BSDIFF, ZERO, and DISCARD. Block OTAs support BSDIFF
+patches and move, new, zero, erase, stash, and free commands. Asgard rejects
+unsupported operations and payloads requiring generated verity/FEC data
+before downloading base images.
+
+## Decrypt a local package
+
+```console
+asgard decrypt SM-A566B EUX ./firmware.zip.enc4 \
   --output ./firmware.zip --resume
 ```
 
-If the package is from an older release, give its version:
+For an older release, pass its full version with `--firmware`. ENC2 packages
+require both `--enc-ver 2` and `--firmware`.
+
+## Save a device profile
+
+Save a model and CSC under a name, then use that name in place of both codes:
 
 ```console
-asgard decrypt SM-S721B EUX ./firmware.zip.enc4 \
-  --firmware S721BXXSACZB2/S721BOXMACZB2/S721BXXSACZB2/S721BXXSACZB2 \
-  --output ./firmware.zip
+asgard profile add my-phone SM-A566B EUX
+asgard checkupdate my-phone
+asgard download my-phone --decrypt --resume -o ./downloads
 ```
 
-For an ENC2 package, add `--enc-ver 2` and always provide the firmware version.
-
-## Save a model and CSC as a profile
-
-If you use the same device often, give its model and CSC a name:
+Inspect or remove saved profiles:
 
 ```console
-asgard profile add my-phone SM-S721B EUX
 asgard profile list
 asgard profile show my-phone
-asgard checkupdate my-phone
-asgard download my-phone --output ./downloads --resume
+asgard profile remove my-phone
 ```
 
-Remove it with `asgard profile remove my-phone`. Profiles live in
-`$XDG_CONFIG_HOME/asgard` when `XDG_CONFIG_HOME` is set, or in
+Profiles live in `$XDG_CONFIG_HOME/asgard` when `XDG_CONFIG_HOME` is set, or
 `~/.config/asgard` otherwise.
 
-## Run several downloads
+## Batch downloads
 
-Put jobs in a TOML or JSON file. A TOML file has one `[[downloads]]` table per
-job:
+Put full package download jobs in a TOML or JSON file. Each TOML job gets its
+own `[[downloads]]` table:
 
 ```toml
 [[downloads]]
-profile = "my-phone"
-output = "./downloads"
+model = "SM-A566B"
+region = "EUX"
+output = "./downloads/a56"
 decrypt = true
 resume = true
 manifest = ""
 
 [[downloads]]
 model = "SM-S721B"
-region = "ZTO"
-firmware = "S721BXXSDDZG1/S721BOWODDZG1/S721BXXSDDZG1/S721BXXSDDZG1"
-output = "./downloads"
+region = "EUX"
+output = "./downloads/s721b"
 threads = 4
 limit_rate = "20M"
 ```
 
+Preview the jobs before downloading:
+
 ```console
-asgard batch firmware.toml
 asgard batch firmware.toml --dry-run --json
+asgard batch firmware.toml
 ```
 
-`--dry-run` checks the jobs without downloading. A JSON batch file can be an
-array of jobs or an object with a `downloads` array.
+A job can use `profile = "my-phone"` instead of `model` and `region`, or include
+`firmware` to select a release. JSON files accept an array of jobs or an object
+with a `downloads` array. TOML batch files require Python 3.11 or newer; use
+JSON on Python 3.10.
 
 ## Check files and write manifests
-
-Check a local package or image with `verify`:
 
 ```console
 asgard verify ./firmware.zip
 asgard verify ./super.img --json
+asgard manifest ./firmware.zip -o ./firmware.json
 ```
 
-Asgard calculates SHA-256 and MD5 hashes. Where applicable, it also checks
-ZIP CRCs, TAR structure, AES block alignment for encrypted FUS packages, and
-Android sparse-image structure.
+`verify` calculates SHA-256 and MD5 hashes. Depending on the format, it also
+checks ZIP CRCs, TAR structure, AES block alignment, and Android sparse-image
+structure.
 
-Use `manifest` to write a JSON record for a file:
+`manifest` records hashes and archive entries in JSON. Super-image manifests
+also include logical partition details. Add `--model`, `--region`, and
+`--firmware` to include device metadata, or add `--manifest` to a download or
+decryption command:
 
 ```console
-asgard manifest ./firmware.zip \
-  --model SM-S721B --region EUX \
-  --firmware S721BXXSACZB2/S721BOXMACZB2/S721BXXSACZB2/S721BXXSACZB2
+asgard download SM-A566B EUX --decrypt --resume -o ./downloads --manifest
 ```
-
-Or add `--manifest` to a download or decryption command:
-
-```console
-asgard download SM-S721B EUX --decrypt --output ./downloads --manifest
-```
-
-Manifests include hashes and archive entry details. For `super.img` and
-`super.img.lz4`, they also include logical partition details.
 
 ## Exit codes
 
-`0` means the command succeeded. `2` means invalid usage or a missing input
-file. `1` means an operation or network request failed.
+| Code | Meaning |
+| --- | --- |
+| `0` | Command succeeded. |
+| `1` | Operation or network request failed. |
+| `2` | Invalid usage or a missing input file. |
 
-## Contributing
+## Development
 
-Bug reports and pull requests are welcome. Run the linter before submitting a
-change:
+Install the project and its test tools from a checkout:
 
 ```console
-ruff check asgard
+python3 -m pip install -e . pytest ruff
+ruff check asgard tests
+python3 -m pytest
 ```
 
-Run the regression tests with `python3 -m pytest`. They use a local HTTP server
-to check interrupted transfers, range validation, rate limits, cache reuse,
-decryption, and extraction without contacting FUS.
+The regression tests use a local HTTP server to check interrupted transfers,
+range validation, rate limits, authentication recovery, decryption, and
+extraction. They do not contact FUS.
 
-To compare request counts, transferred bytes, and extraction time with an
-earlier Git revision:
+Compare request counts, transferred bytes, and extraction time with an earlier
+Git revision:
 
 ```console
 python3 -m benchmarks.performance --baseline REVISION --latency-ms 50
+python3 -m benchmarks.performance --parallel-stream-only
 ```
 
-The benchmark serves synthetic firmware locally. Its timing reflects the
-configured request latency and local hardware.
+Replace `REVISION` with a commit or tag. The benchmark serves synthetic firmware
+locally; its timing depends on the configured latency and local hardware.
 
 ## License
 
-Asgard is licensed under the GNU General Public License v3.0 only. See
-[`LICENSE`](LICENSE) for the full text.
+GPL-3.0-only. See [LICENSE](LICENSE).

@@ -58,6 +58,7 @@ __all__ = [
 
 _ZIP_LOCAL_FILE_HEADER = struct.Struct("<I5H3I2H")
 _ZIP_LOCAL_FILE_HEADER_SIGNATURE = 0x04034B50
+_ZIP_MAX_HEADER_SIZE = _ZIP_LOCAL_FILE_HEADER.size + 2 * 0xFFFF
 _GZIP_HEADER = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff"
 _T = TypeVar("_T")
 
@@ -166,6 +167,7 @@ def _open_remote_firmware_archive(
     firmware_version: str | None = None,
     timeout_s: int = 30,
     rate_limit: int | None = None,
+    threads: int | None = None,
 ) -> Iterator[_RemoteFirmwareArchive]:
     with (
         PipelineProgress() as progress,
@@ -175,6 +177,7 @@ def _open_remote_firmware_archive(
             firmware_version=firmware_version,
             timeout_s=timeout_s,
             rate_limit=rate_limit,
+            threads=threads,
             network_progress=progress.add_download,
         ) as remote,
     ):
@@ -190,6 +193,7 @@ def _remote_firmware_archive(
     timeout_s: int,
     rate_limit: int | None,
     network_progress: Callable[[int], None],
+    threads: int | None = None,
 ) -> Iterator[_RemoteFirmwareArchive]:
     model_u, region_u = _fus._device_codes(model, region)
     client = _fus.FUSClient(timeout_s=timeout_s)
@@ -215,6 +219,7 @@ def _remote_firmware_archive(
             stream_chunk_size=_ARCHIVE_COPY_CHUNK_SIZE,
             rate_limiter=_fus.BandwidthLimiter(rate_limit),
             network_progress=network_progress,
+            threads=threads,
         )
     except Exception:
         client.session.close()
@@ -256,6 +261,7 @@ def list_firmware_entries(
     firmware_version: str | None = None,
     timeout_s: int = 30,
     rate_limit: int | None = None,
+    threads: int | None = None,
 ) -> FirmwareArchiveListing:
     with _open_remote_firmware_archive(
         model=model,
@@ -263,6 +269,7 @@ def list_firmware_entries(
         firmware_version=firmware_version,
         timeout_s=timeout_s,
         rate_limit=rate_limit,
+        threads=threads,
     ) as remote:
         entries = tuple(
             FirmwareArchiveEntry(
@@ -705,7 +712,10 @@ def _open_firmware_tar(
     remote: _RemoteFirmwareArchive,
     outer_entry: zipfile.ZipInfo,
 ) -> Iterator[tarfile.TarFile]:
-    with remote.reader.streaming(), remote.archive.open(outer_entry, "r") as entry_source:
+    with (
+        remote.reader.streaming(end=outer_entry.header_offset + _ZIP_MAX_HEADER_SIZE + outer_entry.compress_size),
+        remote.archive.open(outer_entry, "r") as entry_source,
+    ):
         mode = "r:" if outer_entry.compress_type == zipfile.ZIP_STORED else "r|"
         source_context = (
             nullcontext(entry_source)
@@ -729,6 +739,7 @@ def iter_firmware_tar_entries(
     firmware_version: str | None = None,
     timeout_s: int = 30,
     rate_limit: int | None = None,
+    threads: int | None = None,
 ) -> Iterator[FirmwareTarEntry]:
     with _open_remote_firmware_archive(
         model=model,
@@ -736,6 +747,7 @@ def iter_firmware_tar_entries(
         firmware_version=firmware_version,
         timeout_s=timeout_s,
         rate_limit=rate_limit,
+        threads=threads,
     ) as remote:
         outer_entry = _select_single_firmware_entry(remote.archive.infolist(), outer_selector)
         if outer_entry.compress_type == zipfile.ZIP_DEFLATED:
@@ -893,6 +905,7 @@ def download_firmware_tar_member(
     resume: bool = False,
     timeout_s: int = 30,
     rate_limit: int | None = None,
+    threads: int | None = None,
 ) -> Path:
     requested_name = str(member_name or "").strip().replace("\\", "/")
     if not requested_name:
@@ -918,6 +931,7 @@ def download_firmware_tar_member(
         firmware_version=firmware_version,
         timeout_s=timeout_s,
         rate_limit=rate_limit,
+        threads=threads,
     ) as remote:
         outer_entry = _select_single_firmware_entry(remote.archive.infolist(), outer_selector)
         print_info(f"model: {remote.model}")
@@ -1052,6 +1066,7 @@ def download_firmware_partition_files(
     firmware_version: str | None = None,
     timeout_s: int = 30,
     rate_limit: int | None = None,
+    threads: int | None = None,
 ) -> tuple[Path, ...]:
     """Extract named partition files without staging decoded images on disk."""
     requested = group_partition_paths(paths, partition)
@@ -1061,6 +1076,7 @@ def download_firmware_partition_files(
         firmware_version=firmware_version,
         timeout_s=timeout_s,
         rate_limit=rate_limit,
+        threads=threads,
     ) as remote:
         outer = _select_single_firmware_entry(remote.archive.infolist(), outer_selector)
         print_info(f"model: {remote.model}")
@@ -1230,6 +1246,7 @@ def _run_firmware_super_operation(
     prefer_cached: bool,
     timeout_s: int = 30,
     rate_limit: int | None = None,
+    threads: int | None = None,
 ) -> _T:
     with _open_remote_firmware_archive(
         model=model,
@@ -1237,6 +1254,7 @@ def _run_firmware_super_operation(
         firmware_version=firmware_version,
         timeout_s=timeout_s,
         rate_limit=rate_limit,
+        threads=threads,
     ) as remote:
         outer_entry = _select_single_firmware_entry(remote.archive.infolist(), outer_selector)
         print_info(f"model: {remote.model}")
@@ -1259,6 +1277,7 @@ def iter_firmware_super_partitions(
     firmware_version: str | None = None,
     timeout_s: int = 30,
     rate_limit: int | None = None,
+    threads: int | None = None,
 ) -> Iterator[FirmwareSuperPartition]:
     partitions = _run_firmware_super_operation(
         model=model,
@@ -1269,6 +1288,7 @@ def iter_firmware_super_partitions(
         prefer_cached=True,
         timeout_s=timeout_s,
         rate_limit=rate_limit,
+        threads=threads,
     )
     yield from partitions
 
@@ -1284,6 +1304,7 @@ def download_firmware_super_partitions(
     resume: bool = False,
     timeout_s: int = 30,
     rate_limit: int | None = None,
+    threads: int | None = None,
     slot_fallback: bool = False,
 ) -> tuple[Path, ...]:
     requested = None if partitions is None else tuple(partitions)
@@ -1342,6 +1363,7 @@ def download_firmware_super_partitions(
         prefer_cached=False,
         timeout_s=timeout_s,
         rate_limit=rate_limit,
+        threads=threads,
     )
 
 
@@ -1355,6 +1377,7 @@ def download_firmware_entries(
     resume: bool = False,
     timeout_s: int = 30,
     rate_limit: int | None = None,
+    threads: int | None = None,
 ) -> tuple[Path, ...]:
     selector_values = tuple(str(selector) for selector in selectors)
     if not selector_values:
@@ -1371,6 +1394,7 @@ def download_firmware_entries(
         firmware_version=firmware_version,
         timeout_s=timeout_s,
         rate_limit=rate_limit,
+        threads=threads,
     ) as remote:
         selected = _select_firmware_entries(remote.archive.infolist(), selector_values)
         destinations: list[tuple[zipfile.ZipInfo, Path]] = []
@@ -1408,7 +1432,10 @@ def download_firmware_entries(
                 if initial_size == entry.file_size:
                     done = initial_size
                 else:
-                    with remote.archive.open(entry, "r") as source:
+                    with (
+                        remote.reader.streaming(end=entry.header_offset + _ZIP_MAX_HEADER_SIZE + entry.compress_size),
+                        remote.archive.open(entry, "r") as source,
+                    ):
                         if initial_size:
                             _discard_stream(source, initial_size, entry.filename)
                         with (

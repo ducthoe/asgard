@@ -248,6 +248,7 @@ def download_and_merge_ota(
     force: bool = False,
     timeout_s: int = 30,
     rate_limit: int | None = None,
+    threads: int | None = None,
 ) -> OtaMergeResult:
     plan = inspect_ota(ota_path, forced_type=forced_type, verify=verify)
     selected, selected_files = select_ota_targets(plan, partitions, files)
@@ -294,6 +295,7 @@ def download_and_merge_ota(
                 resume=resume,
                 timeout_s=timeout_s,
                 rate_limit=rate_limit,
+                threads=threads,
                 preferred_archives=source_archive_hints(plan.metadata),
                 source_cache=output_dir / ".asgard-ota-sources.json",
             )
