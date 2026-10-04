@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import stat
 import struct
+import zlib
 from collections.abc import Iterator
 from dataclasses import dataclass
 
@@ -14,6 +15,7 @@ from .random_access import ReadableImage
 _BLOCK = 4096
 _DIRECT_INODE = 923
 _DIRECT_NODE = 1018
+_MAGIC = 0xF2F52010
 
 
 def _u16(data: bytes, offset: int) -> int:
@@ -22,6 +24,17 @@ def _u16(data: bytes, offset: int) -> int:
 
 def _u32(data: bytes, offset: int) -> int:
     return struct.unpack_from("<I", data, offset)[0]
+
+
+def _checkpoint_version(raw: bytes) -> int | None:
+    offset = _u32(raw, 164)
+    if not 192 <= offset <= _BLOCK - 4:
+        return None
+    crc = zlib.crc32(raw[:offset], _MAGIC ^ 0xFFFFFFFF)
+    crc = zlib.crc32(raw[offset + 4 :], crc) ^ 0xFFFFFFFF
+    if crc != _u32(raw, offset):
+        return None
+    return struct.unpack_from("<Q", raw, 0)[0]
 
 
 @dataclass(frozen=True)
@@ -40,11 +53,13 @@ class F2FS:
     def __init__(self, image: ReadableImage):
         self.image = image
         superblock = image.read_at(1024, _BLOCK - 1024)
-        if _u32(superblock, 0) != 0xF2F52010:
+        if _u32(superblock, 0) != _MAGIC:
             raise FUSError("not an F2FS filesystem")
         if _u32(superblock, 16) != 12:
             raise FUSError("unsupported F2FS block size")
-        self.blocks_per_segment = 1 << _u32(superblock, 20)
+        if _u32(superblock, 20) != 9:
+            raise FUSError("unsupported F2FS segment size")
+        self.blocks_per_segment = 512
         self.checkpoint_block = _u32(superblock, 76)
         self.nat_block = _u32(superblock, 84)
         self.root_nid = _u32(superblock, 96)
@@ -60,8 +75,15 @@ class F2FS:
                 raw = image.read_at(block * _BLOCK, _BLOCK)
             except FUSError:
                 continue
-            version = struct.unpack_from("<Q", raw, 0)[0]
-            if version and _u32(raw, 136) < self.blocks_per_segment:
+            version = _checkpoint_version(raw)
+            pack_size = _u32(raw, 136)
+            if version is None or not 2 < pack_size <= self.blocks_per_segment:
+                continue
+            try:
+                last = image.read_at((block + pack_size - 1) * _BLOCK, _BLOCK)
+            except FUSError:
+                continue
+            if _checkpoint_version(last) == version:
                 checkpoints.append((version, block, raw))
         if not checkpoints:
             raise FUSError("F2FS checkpoint not found")
@@ -104,8 +126,13 @@ class F2FS:
         if _u32(raw, _BLOCK - 20) != nid:
             raise FUSError("F2FS inode footer mismatch")
         flags = raw[3]
-        extra_words = _u16(raw, 360) // 4 if flags & 0x20 else 0
+        extra_size = _u16(raw, 360) if flags & 0x20 else 0
+        if extra_size % 4 or extra_size > 4 * (_DIRECT_INODE - 1):
+            raise FUSError("invalid F2FS extra inode size")
+        extra_words = extra_size // 4
         inline_xattrs = (_u16(raw, 362) if flags & 0x20 and self.flexible_inline_xattr else 50) if flags & 1 else 0
+        if extra_words + inline_xattrs >= _DIRECT_INODE:
+            raise FUSError("invalid F2FS inline attribute size")
         mode = _u16(raw, 0)
         size = struct.unpack_from("<Q", raw, 16)[0]
         if _u32(raw, 80) & 0x04:

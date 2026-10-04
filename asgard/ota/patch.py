@@ -281,6 +281,10 @@ def apply_bsdiff_to_file(
                 remaining -= amount
                 new_position += amount
             old_position += seek
-        if new_position != target_size or diff.read(1) or extra.read(1):
+        if (
+            new_position != target_size
+            or _read_decoded(diff, 1, allow_eof=True)
+            or _read_decoded(extra, 1, allow_eof=True)
+        ):
             raise FUSError("bsdiff streams do not match the declared target size")
     return sha1.hexdigest(), sha256.hexdigest()

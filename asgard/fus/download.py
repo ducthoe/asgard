@@ -20,10 +20,8 @@ from ..cli.progress import render_progress as _render_progress
 from ..core.constants import (
     _AES_BLOCK_SIZE,
     _DOWNLOAD_CHUNK_SIZE,
-    _DOWNLOAD_RECOVERY_INTERVAL,
     _DOWNLOAD_RETRIES,
     _PROGRESS_REFRESH_S,
-    _RATE_LIMIT_COOLDOWN_S,
     _RESUME_META_SAVE_INTERVAL_S,
     _RETRY_BACKOFF_S,
 )
@@ -42,7 +40,7 @@ from .resume import (
     _save_range_resume_state,
 )
 from .scheduling import AdaptiveDownloadGate, split_download_ranges
-from .transfer import BandwidthLimiter, _validate_content_range
+from .transfer import BandwidthLimiter, _ResponseTracker, _validate_content_range
 
 
 def _download_output_path(
@@ -110,13 +108,13 @@ def _download_ranges_parallel(
     ranges[:] = split_download_ranges(ranges, workers=workers)
     state_lock = threading.Lock()
     stop_event = threading.Event()
+    responses = _ResponseTracker(stop_event, cancel_pending=lambda: client.cancel_downloads(stop_event))
     errors: list[Exception] = []
     started_at = time.monotonic()
     last_meta_save = 0.0
     last_saved_offsets: tuple[int, ...] | None = None
     meta_path = _resume_state_path(out_path)
     initial_done = _resume_done_bytes(ranges)
-    recovery_lock = threading.Lock()
     worker_finished = threading.Event()
     pending_ranges = deque(idx for idx, item in enumerate(ranges) if item["offset"] <= item["end"])
     worker_limit = min(workers, len(pending_ranges))
@@ -160,7 +158,10 @@ def _download_ranges_parallel(
                 response: requests.Response | None = None
                 retry_error: Exception | None = None
                 try:
-                    response = client.download_file(remote_path, start=request_start, end=seg_end)
+                    response = client.download_file(
+                        remote_path, start=request_start, end=seg_end, stop_event=stop_event
+                    )
+                    responses.add(response)
                     _validate_content_range(
                         response,
                         start=request_start,
@@ -231,7 +232,7 @@ def _download_ranges_parallel(
                 finally:
                     try:
                         if response is not None:
-                            response.close()
+                            responses.close(response)
                     finally:
                         gate.release()
                 if retry_error is None:
@@ -244,17 +245,6 @@ def _download_ranges_parallel(
                     return
                 if isinstance(retry_error, RateLimitedError):
                     continue
-                if recover_download is not None and attempts % _DOWNLOAD_RECOVERY_INTERVAL == 0:
-                    try:
-                        with recovery_lock:
-                            recover_download()
-                    except Exception as recovery_exc:
-                        stop_event.set()
-                        with state_lock:
-                            errors.append(FUSError(f"download recovery failed: {recovery_exc}"))
-                        return
-                    if stop_event.wait(_RATE_LIMIT_COOLDOWN_S):
-                        return
                 if stop_event.wait(_RETRY_BACKOFF_S * attempts):
                     return
 
@@ -277,8 +267,8 @@ def _download_ranges_parallel(
     threads: list[threading.Thread] = []
     try:
         _save_range_resume_state(meta_path, total_size, ranges)
-        for _ in range(worker_limit):
-            thread = threading.Thread(target=run_worker, daemon=True)
+        for index in range(worker_limit):
+            thread = threading.Thread(target=run_worker, name=f"asgard-download-{index}", daemon=True)
             thread.start()
             threads.append(thread)
         while any(thread.is_alive() for thread in threads):
@@ -309,9 +299,10 @@ def _download_ranges_parallel(
             if any(thread.is_alive() for thread in threads):
                 worker_finished.wait(_PROGRESS_REFRESH_S)
     finally:
-        stop_event.set()
+        responses.cancel()
+        deadline = time.monotonic() + 1.0
         for thread in threads:
-            thread.join()
+            thread.join(max(0, deadline - time.monotonic()))
         with state_lock:
             snapshot = [dict(item) for item in ranges]
         _save_range_resume_state(meta_path, total_size, snapshot)

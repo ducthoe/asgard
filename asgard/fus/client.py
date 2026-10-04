@@ -14,8 +14,9 @@ from math import isfinite
 import requests
 
 from ..core.constants import _FUS_BASE_URL, _FUS_DOWNLOAD_URL, _RETRY_BACKOFF_S
-from ..core.errors import FUSError, RateLimitedError, RetryableDownloadError
+from ..core.errors import DownloadCancelledError, FUSError, RateLimitedError, RetryableDownloadError
 from .auth import FUSAuth
+from .http import DOWNLOAD_STOP, DownloadHTTPAdapter
 from .protocol import _xml_text
 
 
@@ -52,6 +53,7 @@ class FUSClient(FUSAuth):
         self._auth_generation = 0
         self._download_recovery: Callable[[], None] | None = None
         self._download_recovery_lock = threading.Lock()
+        self._download_adapter: DownloadHTTPAdapter | None = None
 
     def __enter__(self) -> FUSClient:
         return self
@@ -62,10 +64,19 @@ class FUSClient(FUSAuth):
 
     def configure_download_pool(self, workers: int) -> None:
         if self._owns_session:
+            self._download_adapter = DownloadHTTPAdapter(
+                pool_connections=2, pool_maxsize=max(1, workers), pool_block=True
+            )
             self.session.mount(
                 _FUS_DOWNLOAD_URL,
-                requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=max(1, workers), pool_block=True),
+                self._download_adapter,
             )
+            self.session.mount(_FUS_BASE_URL, self._download_adapter)
+
+    def cancel_downloads(self, stop_event: threading.Event) -> None:
+        stop_event.set()
+        if self._download_adapter is not None:
+            self._download_adapter.cancel(stop_event)
 
     def configure_download_recovery(self, recovery: Callable[[], None]) -> None:
         with self._download_recovery_lock:
@@ -155,9 +166,12 @@ class FUSClient(FUSAuth):
         *,
         start: int = 0,
         end: int | None = None,
+        stop_event: threading.Event | None = None,
     ) -> requests.Response:
         url = f"{_FUS_DOWNLOAD_URL}?file={remote_path}"
         for attempt in range(2):
+            if stop_event is not None and stop_event.is_set():
+                raise DownloadCancelledError("download cancelled")
             with self._download_recovery_lock:
                 generation = self._auth_generation
                 headers = self._download_headers()
@@ -165,13 +179,27 @@ class FUSClient(FUSAuth):
                 headers["Range"] = f"bytes={start}-{end}"
             elif start > 0:
                 headers["Range"] = f"bytes={start}-"
-            response = self.session.get(url, headers=headers, stream=True, timeout=self.timeout_s)
+            token = DOWNLOAD_STOP.set(stop_event)
+            try:
+                response = self.session.get(url, headers=headers, stream=True, timeout=self.timeout_s)
+            finally:
+                DOWNLOAD_STOP.reset(token)
+            if stop_event is not None and stop_event.is_set():
+                response.close()
+                raise DownloadCancelledError("download cancelled")
             if response.status_code == 401:
                 response.close()
                 if attempt:
                     raise FUSError("FUS download authorization failed after session recovery (HTTP 401)")
-                self._recover_download_auth(generation)
-                time.sleep(_RETRY_BACKOFF_S)
+                token = DOWNLOAD_STOP.set(stop_event)
+                try:
+                    self._recover_download_auth(generation)
+                finally:
+                    DOWNLOAD_STOP.reset(token)
+                if stop_event is None:
+                    time.sleep(_RETRY_BACKOFF_S)
+                elif stop_event.wait(_RETRY_BACKOFF_S):
+                    raise DownloadCancelledError("download cancelled")
                 continue
             if response.status_code in (429, 503):
                 retry_after = _retry_after_seconds(response.headers.get("Retry-After"))

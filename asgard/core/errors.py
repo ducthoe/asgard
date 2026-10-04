@@ -12,6 +12,10 @@ class RetryableDownloadError(FUSError):
     pass
 
 
+class DownloadCancelledError(FUSError):
+    pass
+
+
 class RateLimitedError(RetryableDownloadError):
     def __init__(self, message: str, *, retry_after_s: float | None = None):
         super().__init__(message)

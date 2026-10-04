@@ -145,6 +145,10 @@ to the decoder. Each connection can buffer up to 16 MiB ahead, so the default
 network buffer holds at most 96 MiB. ZIP decoding, LZ4 decoding, and partition
 copying can overlap through buffered worker threads.
 
+Extraction starts with a smaller first range and adjusts later ranges from
+1 to 16 MiB using measured transfer speeds. This reduces waiting behind a slow
+range while keeping the connection limit and request spacing.
+
 HTTP 429 or 503 responses reduce concurrency. Workers share the cooldown and
 honor `Retry-After`. After the cooldown, Asgard increases concurrency when
 measured aggregate throughput improves.
@@ -311,6 +315,7 @@ asgard download SM-A566B EUX --decrypt --resume -o ./downloads --manifest
 | `0` | Command succeeded. |
 | `1` | Operation or network request failed. |
 | `2` | Invalid usage or a missing input file. |
+| `130` | Interrupted with Ctrl+C. |
 
 ## Development
 
@@ -332,6 +337,7 @@ Git revision:
 ```console
 python3 -m benchmarks.performance --baseline REVISION --latency-ms 50
 python3 -m benchmarks.performance --parallel-stream-only
+python3 -m benchmarks.performance --compare-ranges --first-range-factor 0.25
 ```
 
 Replace `REVISION` with a commit or tag. The benchmark serves synthetic firmware

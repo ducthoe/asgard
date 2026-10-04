@@ -23,6 +23,7 @@ from lz4 import frame as lz4_frame
 from asgard import fus
 from asgard.cli.app import _build_parser, _handle_download
 from asgard.core.errors import FUSError
+from asgard.core.streaming import open_prefetched_stream
 from asgard.formats import archive as archive_module
 from asgard.fus import client as client_module
 from asgard.fus import download, scheduling, streaming, transfer
@@ -42,7 +43,7 @@ def encrypt(data):
 
 def set_stream_range_size(monkeypatch, size):
     for module in (streaming, transfer):
-        monkeypatch.setattr(module, "_DOWNLOAD_MIN_RANGE_SIZE", size)
+        monkeypatch.setattr(module, "_STREAM_MAX_RANGE_SIZE", size)
 
 
 def super_image(plain):
@@ -77,6 +78,7 @@ def server(monkeypatch):
         requests=[],
         connections=set(),
         drops=0,
+        empty_drops=0,
         throttles=0,
         throttle_status=429,
         bad_range=False,
@@ -92,6 +94,8 @@ def server(monkeypatch):
         chunk_delay=0,
         first_range_delay=0,
         stall=None,
+        header_stall=None,
+        auth_stall=None,
         stalled=threading.Event(),
     )
 
@@ -111,6 +115,11 @@ def server(monkeypatch):
             start, end = map(int, re.fullmatch(r"bytes=(\d+)-(\d+)", self.headers["Range"]).groups())
             state.requests.append((start, end, time.monotonic()))
             state.connections.add(self.client_address)
+            if state.header_stall is not None and end - start + 1 > 128 * 1024:
+                state.stalled.set()
+                state.header_stall.wait(5)
+                self.close_connection = True
+                return
             if state.auth_required and not state.authorized:
                 self.send_response(401)
                 self.send_header("Content-Length", "0")
@@ -128,6 +137,11 @@ def server(monkeypatch):
             self.send_header("Content-Range", f"bytes {range_start}-{end}/{len(state.data)}")
             self.send_header("Content-Length", str(end - start + 1))
             self.end_headers()
+            if state.empty_drops and start == 0:
+                state.empty_drops -= 1
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.close_connection = True
+                return
             if state.drops:
                 state.drops -= 1
                 self.wfile.write(state.data[start : min(end + 1, start + 100000)])
@@ -160,6 +174,11 @@ def server(monkeypatch):
 
         def do_POST(self):
             self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            if state.auth_stall is not None:
+                state.stalled.set()
+                state.auth_stall.wait(5)
+                self.close_connection = True
+                return
             self.send_response(200)
             if self.path.endswith(FUSClient.GENERATE_NONCE_PATH):
                 state.nonce_requests += 1
@@ -187,6 +206,10 @@ def server(monkeypatch):
     finally:
         if state.stall is not None:
             state.stall.set()
+        if state.header_stall is not None:
+            state.header_stall.set()
+        if state.auth_stall is not None:
+            state.auth_stall.set()
         httpd.shutdown()
         httpd.server_close()
         thread.join()
@@ -403,6 +426,194 @@ def test_parallel_stream_cancels_stalled_connections(server, monkeypatch):
         assert time.monotonic() - started < 1.5
         assert reader._gate.active == 0
         assert not any(thread.name.startswith("asgard-range-") for thread in threading.enumerate())
+
+
+@pytest.mark.parametrize("lz4", [False, True])
+def test_network_prefetch_close_cancels_zip_and_lz4_reads(server, monkeypatch, lz4):
+    set_stream_range_size(monkeypatch, 256 * 1024)
+    plain = random.Random(40).randbytes(2 * 1024 * 1024)
+    content = lz4_frame.compress(plain) if lz4 else plain
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as archive:
+        archive.writestr("image.bin", content, compress_type=zipfile.ZIP_DEFLATED)
+    server.data = encrypt(zip_buffer.getvalue())
+    with (
+        FUSClient() as client,
+        _FUSDecryptingReader(client=client, remote_path="test", encrypted_size=len(server.data), key=KEY) as reader,
+        zipfile.ZipFile(reader) as archive,
+        archive.open("image.bin") as source,
+        reader.streaming(),
+    ):
+        server.stall = threading.Event()
+        decoded = lz4_frame.LZ4FrameFile(source) if lz4 else source
+        with open_prefetched_stream(decoded):
+            assert server.stalled.wait(2)
+            started = time.monotonic()
+        assert time.monotonic() - started < 1.0
+        if lz4:
+            decoded.close()
+    assert not any(
+        thread.name in ("asgard-prefetch",) or thread.name.startswith("asgard-range-")
+        for thread in threading.enumerate()
+    )
+
+
+def test_interrupted_full_download_closes_stalled_sockets(server, tmp_path, monkeypatch):
+    monkeypatch.setattr(scheduling, "_DOWNLOAD_MIN_RANGE_SIZE", 256 * 1024)
+    server.data = bytes(2 * 1024 * 1024)
+    server.stall = threading.Event()
+    path = tmp_path / "cancelled.part"
+    ranges, meta = _prepare_range_resume_state(path, len(server.data), False, part_count=1)
+    interrupted_at = []
+
+    def interrupt(*args, **kwargs):
+        if server.stalled.is_set():
+            interrupted_at.append(time.monotonic())
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(download, "_render_progress", interrupt)
+    with FUSClient() as client, pytest.raises(KeyboardInterrupt):
+        client.configure_download_pool(6)
+        download._download_ranges_parallel(
+            client=client, remote_path="test", out_path=path, total_size=len(server.data), ranges=ranges
+        )
+    assert time.monotonic() - interrupted_at[0] < 1.0
+    assert meta.is_file()
+    assert not any(thread.name.startswith("asgard-download-") for thread in threading.enumerate())
+
+
+def test_cancel_pending_headers_releases_workers_and_allows_another_transfer(server, monkeypatch):
+    set_stream_range_size(monkeypatch, 256 * 1024)
+    plain = random.Random(43).randbytes(2 * 1024 * 1024)
+    server.data = encrypt(plain)
+    with (
+        FUSClient() as client,
+        _FUSDecryptingReader(client=client, remote_path="test", encrypted_size=len(server.data), key=KEY) as reader,
+    ):
+        server.header_stall = threading.Event()
+        with reader.streaming():
+            reader._open_stream()
+            assert server.stalled.wait(2)
+            deadline = time.monotonic() + 2
+            while len(server.requests) < 7 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            started = time.monotonic()
+            reader.cancel_read()
+        assert time.monotonic() - started < 0.5
+        assert reader._gate.active == 0
+        assert not any(thread.name.startswith("asgard-range-") for thread in threading.enumerate())
+        server.header_stall.set()
+        server.header_stall = None
+        reader.seek(0)
+        with reader.streaming():
+            assert reader.read() == plain
+
+
+def test_cancellation_interrupts_pending_authorization_recovery(server, monkeypatch):
+    set_stream_range_size(monkeypatch, 256 * 1024)
+    server.data = encrypt(random.Random(45).randbytes(2 * 1024 * 1024))
+    with FUSClient() as client:
+
+        def recover():
+            client.refresh_auth()
+            client.make_request(FUSClient.BINARY_INIT_PATH, b"init")
+
+        with _FUSDecryptingReader(
+            client=client, remote_path="test", encrypted_size=len(server.data), key=KEY, recover_download=recover
+        ) as reader:
+            server.auth_required = True
+            server.auth_stall = threading.Event()
+            with reader.streaming():
+                reader._open_stream()
+                assert server.stalled.wait(2)
+                started = time.monotonic()
+                reader.cancel_read()
+            assert time.monotonic() - started < 0.5
+            assert reader._gate.active == 0
+    assert not any(thread.name.startswith("asgard-range-") for thread in threading.enumerate())
+
+
+def test_adaptive_ranges_shrink_after_a_slow_ordered_range(server, monkeypatch):
+    set_stream_range_size(monkeypatch, 4 * 1024 * 1024)
+    plain = random.Random(44).randbytes(32 * 1024 * 1024 + 113)
+    server.data = encrypt(plain)
+    server.chunk_delay = 0.001
+    server.first_range_delay = 2.0
+    received = []
+    with (
+        FUSClient() as client,
+        _FUSDecryptingReader(
+            client=client,
+            remote_path="test",
+            encrypted_size=len(server.data),
+            key=KEY,
+            stream_chunk_size=1024 * 1024,
+            network_progress=received.append,
+        ) as reader,
+        reader.streaming(),
+    ):
+        assert reader.read() == plain
+        assert any(
+            1024 * 1024 <= end - start + 1 < 4 * 1024 * 1024
+            for start, end, _ in server.requests
+            if end < reader._tail_start - 1
+        )
+    assert sum(received) == len(server.data)
+    assert server.max_active == 6
+
+
+@pytest.mark.parametrize("mode", ["metadata", "serial", "parallel", "file"])
+def test_transport_retries_do_not_refresh_authorization(server, tmp_path, monkeypatch, mode):
+    set_stream_range_size(monkeypatch, 256 * 1024)
+    plain = random.Random(41).randbytes(2 * 1024 * 1024)
+    server.data = encrypt(plain)
+    recoveries = []
+
+    def recover():
+        recoveries.append(True)
+
+    with FUSClient() as client:
+        if mode == "metadata":
+            server.empty_drops = 4
+            assert (
+                _read_download_range(
+                    client=client,
+                    remote_path="test",
+                    start=0,
+                    end=len(server.data) - 1,
+                    total_size=len(server.data),
+                    recover_download=recover,
+                )
+                == server.data
+            )
+        elif mode == "file":
+            path = tmp_path / "retry.part"
+            ranges, _ = _prepare_range_resume_state(path, len(server.data), False, part_count=1)
+            server.empty_drops = 4
+            download._download_ranges_parallel(
+                client=client,
+                remote_path="test",
+                out_path=path,
+                total_size=len(server.data),
+                ranges=ranges,
+                workers=1,
+                recover_download=recover,
+            )
+            assert path.read_bytes() == server.data
+        else:
+            with _FUSDecryptingReader(
+                client=client,
+                remote_path="test",
+                encrypted_size=len(server.data),
+                key=KEY,
+                threads=1 if mode == "serial" else 6,
+                recover_download=recover,
+            ) as reader:
+                server.empty_drops = 4
+                assert reader.read() == plain
+    assert not recoveries
+    assert server.empty_drops == 0
+    assert server.nonce_requests == server.init_requests == 0
 
 
 @pytest.mark.parametrize("status", [429, 503])

@@ -6,7 +6,6 @@ from __future__ import annotations
 import io
 import os
 import threading
-import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -18,19 +17,24 @@ from ..core.constants import (
     _AES_BLOCK_SIZE,
     _ARCHIVE_READ_CACHE_SIZE,
     _ARCHIVE_TAIL_CACHE_SIZE,
-    _DOWNLOAD_MIN_RANGE_SIZE,
-    _DOWNLOAD_RECOVERY_INTERVAL,
     _DOWNLOAD_RETRIES,
     _RANGE_CHUNK_SIZE,
-    _RATE_LIMIT_COOLDOWN_S,
     _RETRY_BACKOFF_S,
+    _STREAM_MAX_RANGE_SIZE,
 )
-from ..core.errors import FUSError, RateLimitedError, RetryableDownloadError
+from ..core.errors import DownloadCancelledError, FUSError, RateLimitedError, RetryableDownloadError
 from ..core.resources import download_worker_count
+from ..core.streaming import cancellable_stream
 from .client import FUSClient
 from .crypto import _pkcs7_unpad
 from .scheduling import AdaptiveDownloadGate
-from .transfer import BandwidthLimiter, _ParallelRangeStream, _read_download_range, _validate_content_range
+from .transfer import (
+    BandwidthLimiter,
+    _ParallelRangeStream,
+    _read_download_range,
+    _ResponseTracker,
+    _validate_content_range,
+)
 
 
 class _FUSDecryptingReader(io.RawIOBase):
@@ -46,14 +50,20 @@ class _FUSDecryptingReader(io.RawIOBase):
         rate_limiter: BandwidthLimiter | None = None,
         network_progress: Callable[[int], None] | None = None,
         threads: int | None = None,
+        adaptive_ranges: bool = True,
     ):
         super().__init__()
         self._response: requests.Response | None = None
         self._stop = threading.Event()
+        self._stream_cancelled = threading.Event()
+        self._responses = _ResponseTracker(
+            self._stream_cancelled, cancel_pending=lambda: client.cancel_downloads(self._stream_cancelled)
+        )
         self._cache: OrderedDict[int, bytes] = OrderedDict()
         self._cache_bytes = 0
         self._parallel_stream: _ParallelRangeStream | None = None
         self._workers = download_worker_count(encrypted_size) if threads is None else int(threads)
+        self._adaptive_ranges = adaptive_ranges
         self._gate = AdaptiveDownloadGate(self._workers)
         client.configure_download_pool(self._workers)
         if encrypted_size <= 0 or encrypted_size % _AES_BLOCK_SIZE:
@@ -116,14 +126,17 @@ class _FUSDecryptingReader(io.RawIOBase):
         previous = self._streaming_reads
         previous_end = self._stream_end
         self._streaming_reads = True
+        if not previous:
+            self._stream_cancelled.clear()
         if end is not None:
             self._stream_end = end if previous_end is None else min(end, previous_end)
         try:
-            yield
+            with cancellable_stream(self.cancel_read):
+                yield
         finally:
             self._streaming_reads = previous
             self._stream_end = previous_end
-            if not previous and self._parallel_stream is not None:
+            if not previous:
                 self._close_stream()
 
     def seekable(self) -> bool:
@@ -239,12 +252,21 @@ class _FUSDecryptingReader(io.RawIOBase):
     def close(self) -> None:
         if not self.closed:
             self._stop.set()
+            self.cancel_read()
             self._close_stream()
             self._cache.clear()
             self._cache_bytes = 0
         super().close()
 
+    def cancel_read(self) -> None:
+        self._stream_cancelled.set()
+        self._responses.cancel()
+        if self._parallel_stream is not None:
+            self._parallel_stream.cancel()
+
     def _open_stream(self) -> None:
+        if self._stop.is_set() or self._stream_cancelled.is_set():
+            raise DownloadCancelledError("firmware read cancelled")
         small_read = (
             not self._streaming_reads
             and self._read_hint <= _RANGE_CHUNK_SIZE
@@ -260,7 +282,7 @@ class _FUSDecryptingReader(io.RawIOBase):
         chunk_size = self._stream_chunk_size if not small_read else _RANGE_CHUNK_SIZE
         if self._rate_limiter is not None:
             chunk_size = self._rate_limiter.chunk_size(chunk_size)
-        if self._workers > 1 and request_end - request_start + 1 > _DOWNLOAD_MIN_RANGE_SIZE:
+        if self._workers > 1 and request_end - request_start + 1 > _STREAM_MAX_RANGE_SIZE:
             self._parallel_stream = _ParallelRangeStream(
                 client=self._client,
                 remote_path=self._remote_path,
@@ -273,6 +295,7 @@ class _FUSDecryptingReader(io.RawIOBase):
                 recover_download=self._recover_download,
                 network_progress=self._network_progress,
                 rate_limiter=self._rate_limiter,
+                adaptive=self._adaptive_ranges,
             )
             self._response_iter = self._parallel_stream
         else:
@@ -292,8 +315,10 @@ class _FUSDecryptingReader(io.RawIOBase):
                 self._remote_path,
                 start=request_start,
                 end=request_end,
+                stop_event=self._stream_cancelled,
             )
             try:
+                self._responses.add(response)
                 _validate_content_range(
                     response,
                     start=request_start,
@@ -301,7 +326,7 @@ class _FUSDecryptingReader(io.RawIOBase):
                     total_size=self._encrypted_size,
                 )
             except Exception:
-                response.close()
+                self._responses.close(response)
                 raise
         finally:
             self._gate.release()
@@ -322,12 +347,14 @@ class _FUSDecryptingReader(io.RawIOBase):
         self._response = None
         self._response_iter = None
         if response is not None:
-            response.close()
+            self._responses.close(response)
         if parallel is not None:
             parallel.close()
 
     def _retry_stream(self, exc: Exception) -> None:
         self._close_stream()
+        if self._stop.is_set() or self._stream_cancelled.is_set():
+            raise DownloadCancelledError("firmware read cancelled") from exc
         self._stream_retry = True
         if self._stream_failure_position == self._position:
             self._stream_failures += 1
@@ -339,13 +366,8 @@ class _FUSDecryptingReader(io.RawIOBase):
         if isinstance(exc, RateLimitedError):
             self._gate.throttled(exc.retry_after_s)
             return
-        if self._recover_download is not None and self._stream_failures % _DOWNLOAD_RECOVERY_INTERVAL == 0:
-            try:
-                self._recover_download()
-            except Exception as recovery_exc:
-                raise FUSError(f"download recovery failed: {recovery_exc}") from recovery_exc
-            time.sleep(_RATE_LIMIT_COOLDOWN_S)
-        time.sleep(_RETRY_BACKOFF_S * self._stream_failures)
+        if self._stream_cancelled.wait(_RETRY_BACKOFF_S * self._stream_failures):
+            raise DownloadCancelledError("firmware read cancelled") from exc
 
     def _fill_stream_buffer(self) -> None:
         stream_limit = min(self._size, self._tail_start)

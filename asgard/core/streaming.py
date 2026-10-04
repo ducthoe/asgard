@@ -8,19 +8,29 @@ import os
 import queue
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 
 from ..cli.progress import render_progress
 from .constants import _ARCHIVE_COPY_CHUNK_SIZE, _PROGRESS_REFRESH_S
 from .errors import FUSError
 
 _ZERO_DATA = bytes(_ARCHIVE_COPY_CHUNK_SIZE)
+_CANCEL_SOURCE: ContextVar[Callable[[], None] | None] = ContextVar("asgard_cancel_source", default=None)
+
+
+@contextmanager
+def cancellable_stream(cancel: Callable[[], None]) -> Iterator[None]:
+    token = _CANCEL_SOURCE.set(cancel)
+    try:
+        yield
+    finally:
+        _CANCEL_SOURCE.reset(token)
 
 
 class _PrefetchReader(io.RawIOBase):
-    def __init__(self, source: io.BufferedIOBase):
+    def __init__(self, source: io.BufferedIOBase, *, cancel: Callable[[], None] | None = None):
         super().__init__()
         self._source = source
         self._queue: queue.Queue[bytes | BaseException | None] = queue.Queue(maxsize=2)
@@ -28,6 +38,7 @@ class _PrefetchReader(io.RawIOBase):
         self._buffer = b""
         self._buffer_offset = 0
         self._eof = False
+        self._cancel = cancel or _CANCEL_SOURCE.get()
         self._thread = threading.Thread(
             target=copy_context().run, args=(self._produce,), name="asgard-prefetch", daemon=True
         )
@@ -64,7 +75,11 @@ class _PrefetchReader(io.RawIOBase):
                     self._queue.get_nowait()
                 except queue.Empty:
                     break
-            self._thread.join()
+            self._queue.put_nowait(None)
+            self._thread.join(0.05)
+            if self._thread.is_alive() and self._cancel is not None:
+                self._cancel()
+            self._thread.join(1.0)
         super().close()
 
     def _put(self, item: bytes | BaseException | None) -> bool:
@@ -90,12 +105,15 @@ class _PrefetchReader(io.RawIOBase):
 
 
 @contextmanager
-def open_prefetched_stream(source: io.BufferedIOBase) -> Iterator[io.BufferedReader]:
-    prefetched = _PrefetchReader(source)
+def open_prefetched_stream(
+    source: io.BufferedIOBase, *, cancel: Callable[[], None] | None = None
+) -> Iterator[io.BufferedReader]:
+    prefetched = _PrefetchReader(source, cancel=cancel)
     buffered = io.BufferedReader(prefetched, buffer_size=64 * 1024)
     try:
         yield buffered
     finally:
+        prefetched.close()
         buffered.close()
 
 

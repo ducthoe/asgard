@@ -993,6 +993,8 @@ def main(argv: list[str] | None = None) -> int:
             for item in manifests:
                 print(item["path"])
         return 0
+    except KeyboardInterrupt:
+        return 130
     except ValueError as exc:
         parser.error(str(exc))
     except (FileNotFoundError, FUSError) as exc:

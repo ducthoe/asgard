@@ -21,6 +21,7 @@ dependencies = [
     "lz4>=4.3.2",
     "pycryptodomex>=3.20.0",
     "requests>=2.0.0",
+    "urllib3>=1.26.0",
 ]
 
 [project.urls]

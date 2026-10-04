@@ -1,0 +1,44 @@
+{
+  "ext4": {
+    "size": 16777216,
+    "compressed_sha256": "972ab96880e9e194c8f8ff8068345a9815330c18c9e2697f8d13c2f0aa31452e",
+    "files": {
+      "etc/hello.txt": {
+        "size": 37,
+        "sha256": "87ab657f26b98d29bc8ba3ee67b05fcffb23843455e5456c9def2ca21a2e2fe2"
+      },
+      "data/large.bin": {
+        "size": 5242953,
+        "sha256": "21b8155a5c8531d765e281a055ce5e27bc172f2c159a3975f871606d60578850"
+      }
+    }
+  },
+  "f2fs": {
+    "size": 134217728,
+    "compressed_sha256": "6730c800664c7b06b81ce60883d7eb2c617f0e9d8f5fe876f053f095eedf08fd",
+    "files": {
+      "etc/hello.txt": {
+        "size": 37,
+        "sha256": "87ab657f26b98d29bc8ba3ee67b05fcffb23843455e5456c9def2ca21a2e2fe2"
+      },
+      "data/large.bin": {
+        "size": 5242953,
+        "sha256": "21b8155a5c8531d765e281a055ce5e27bc172f2c159a3975f871606d60578850"
+      }
+    }
+  },
+  "erofs": {
+    "size": 5246976,
+    "compressed_sha256": "7c448ceac824d7b7a2cc00d0da0d6f2d58e61005369a5a1d022f795f25165aa2",
+    "files": {
+      "etc/hello.txt": {
+        "size": 37,
+        "sha256": "87ab657f26b98d29bc8ba3ee67b05fcffb23843455e5456c9def2ca21a2e2fe2"
+      },
+      "data/large.bin": {
+        "size": 5242953,
+        "sha256": "21b8155a5c8531d765e281a055ce5e27bc172f2c159a3975f871606d60578850"
+      }
+    }
+  }
+}

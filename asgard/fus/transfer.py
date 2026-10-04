@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 import socket
+import statistics
 import threading
 import time
 from collections import deque
@@ -16,19 +17,69 @@ import requests
 
 from ..core.constants import (
     _AES_BLOCK_SIZE,
-    _DOWNLOAD_MIN_RANGE_SIZE,
-    _DOWNLOAD_RECOVERY_INTERVAL,
     _DOWNLOAD_RETRIES,
     _PROGRESS_REFRESH_S,
     _RANGE_CHUNK_SIZE,
-    _RATE_LIMIT_COOLDOWN_S,
     _RETRY_BACKOFF_S,
+    _STREAM_FIRST_RANGE_SIZE,
+    _STREAM_MAX_RANGE_SIZE,
+    _STREAM_MIN_RANGE_SIZE,
 )
-from ..core.errors import FUSError, RateLimitedError, RetryableDownloadError
+from ..core.errors import DownloadCancelledError, FUSError, RateLimitedError, RetryableDownloadError
 from .client import FUSClient
 from .scheduling import AdaptiveDownloadGate
 
 _CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", re.IGNORECASE)
+
+
+class _ResponseTracker:
+    def __init__(self, stop: threading.Event, *, cancel_pending: Callable[[], None] | None = None):
+        self._stop = stop
+        self._lock = threading.Lock()
+        self._responses: dict[requests.Response, socket.socket | None] = {}
+        self._cancel_pending = cancel_pending
+
+    @staticmethod
+    def _socket(response: requests.Response) -> socket.socket | None:
+        connection = getattr(response.raw, "_connection", None)
+        sock = getattr(connection, "sock", None)
+        if sock is None:
+            with suppress(AttributeError):
+                sock = response.raw._fp.fp.raw._sock
+        return sock
+
+    def add(self, response: requests.Response) -> None:
+        sock = self._socket(response)
+        with self._lock:
+            if not self._stop.is_set():
+                self._responses[response] = sock
+                return
+        self._abort(response, sock)
+        raise DownloadCancelledError("download cancelled")
+
+    def close(self, response: requests.Response) -> None:
+        try:
+            response.close()
+        finally:
+            with self._lock:
+                self._responses.pop(response, None)
+
+    @staticmethod
+    def _abort(response: requests.Response, sock: socket.socket | None) -> None:
+        if sock is not None:
+            with suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+        with suppress(OSError):
+            response.close()
+
+    def cancel(self) -> None:
+        self._stop.set()
+        if self._cancel_pending is not None:
+            self._cancel_pending()
+        with self._lock:
+            responses = list(self._responses.items())
+        for response, sock in responses:
+            self._abort(response, sock)
 
 
 class BandwidthLimiter:
@@ -156,13 +207,7 @@ def _read_download_range(
             if received == expected_size:
                 chunks.clear()
                 received = 0
-            if recover_download is not None and attempt % _DOWNLOAD_RECOVERY_INTERVAL == 0:
-                try:
-                    recover_download()
-                except Exception as recovery_exc:
-                    raise FUSError(f"download recovery failed: {recovery_exc}") from recovery_exc
-                time.sleep(_RATE_LIMIT_COOLDOWN_S)
-            time.sleep(_RETRY_BACKOFF_S * attempt)
+            stop_event.wait(_RETRY_BACKOFF_S * attempt)
     raise FUSError(f"range {start}-{end} failed")
 
 
@@ -173,6 +218,33 @@ class _RangeBuffer:
     chunks: deque[bytes] = field(default_factory=deque)
     received: int = 0
     done: bool = False
+    started_at: float | None = None
+
+
+class _RangeSizer:
+    def __init__(self, workers: int, *, adaptive: bool):
+        self.maximum = _STREAM_MAX_RANGE_SIZE
+        self.minimum = min(_STREAM_MIN_RANGE_SIZE, self.maximum)
+        self._adaptive = adaptive
+        self._first = True
+        self._rates: deque[float] = deque(maxlen=workers * 2)
+
+    def next_size(self) -> int:
+        if not self._adaptive:
+            return self.maximum
+        if self._first:
+            self._first = False
+            return min(_STREAM_FIRST_RANGE_SIZE, self.maximum)
+        if not self._rates:
+            return self.maximum
+        slowest, fastest = min(self._rates), max(self._rates)
+        rate = slowest if slowest * 2 < fastest else statistics.median(self._rates)
+        size = ((int(rate) + self.minimum - 1) // self.minimum) * self.minimum
+        return min(self.maximum, max(self.minimum, size))
+
+    def observe(self, size: int, elapsed: float) -> None:
+        if size > 0 and elapsed > 0:
+            self._rates.append(size / elapsed)
 
 
 class _ParallelRangeStream(Iterator[bytes]):
@@ -190,6 +262,7 @@ class _ParallelRangeStream(Iterator[bytes]):
         recover_download: Callable[[], None] | None,
         network_progress: Callable[[int], None] | None,
         rate_limiter: BandwidthLimiter | None,
+        adaptive: bool = True,
     ):
         self._client = client
         self._remote_path = remote_path
@@ -197,18 +270,18 @@ class _ParallelRangeStream(Iterator[bytes]):
         self._total_size = total_size
         self._chunk_size = chunk_size
         self._gate = gate
-        self._recover_download = recover_download
         self._network_progress = network_progress
         self._rate_limiter = rate_limiter
         self._condition = threading.Condition()
         self._stop = threading.Event()
         self._buffers: deque[_RangeBuffer] = deque()
         self._pending: deque[_RangeBuffer] = deque()
-        self._responses: dict[requests.Response, socket.socket | None] = {}
+        self._responses = _ResponseTracker(self._stop, cancel_pending=lambda: client.cancel_downloads(self._stop))
         self._error: Exception | None = None
         self._next_start = start
         self._transferred = 0
-        self._workers = min(workers, (end - start + _DOWNLOAD_MIN_RANGE_SIZE) // _DOWNLOAD_MIN_RANGE_SIZE)
+        self._workers = min(workers, (end - start + _STREAM_MAX_RANGE_SIZE) // _STREAM_MAX_RANGE_SIZE)
+        self._sizer = _RangeSizer(self._workers, adaptive=adaptive)
         if recover_download is not None:
             client.configure_download_recovery(recover_download)
         self._extend_window()
@@ -221,7 +294,7 @@ class _ParallelRangeStream(Iterator[bytes]):
 
     def _extend_window(self) -> None:
         while len(self._buffers) < self._workers and self._next_start <= self._end:
-            end = min(self._end, self._next_start + _DOWNLOAD_MIN_RANGE_SIZE - 1)
+            end = min(self._end, self._next_start + self._sizer.next_size() - 1)
             buffer = _RangeBuffer(self._next_start, end)
             self._buffers.append(buffer)
             self._pending.append(buffer)
@@ -255,6 +328,8 @@ class _ParallelRangeStream(Iterator[bytes]):
                     buffer = self._pending.popleft()
                 self._download(buffer)
                 with self._condition:
+                    if buffer.started_at is not None:
+                        self._sizer.observe(buffer.received, time.monotonic() - buffer.started_at)
                     buffer.done = True
                     self._condition.notify_all()
         except Exception as exc:
@@ -273,17 +348,13 @@ class _ParallelRangeStream(Iterator[bytes]):
             retry_error = None
             try:
                 start = buffer.start + buffer.received
-                response = self._client.download_file(self._remote_path, start=start, end=buffer.end)
-                with self._condition:
-                    if self._stop.is_set():
-                        return
-                    connection = getattr(response.raw, "_connection", None)
-                    sock = getattr(connection, "sock", None)
-                    if sock is None:
-                        with suppress(AttributeError):
-                            sock = response.raw._fp.fp.raw._sock
-                    self._responses[response] = sock
+                response = self._client.download_file(
+                    self._remote_path, start=start, end=buffer.end, stop_event=self._stop
+                )
+                self._responses.add(response)
                 _validate_content_range(response, start=start, end=buffer.end, total_size=self._total_size)
+                if buffer.started_at is None:
+                    buffer.started_at = time.monotonic()
                 for chunk in response.iter_content(chunk_size=self._chunk_size):
                     if self._stop.is_set():
                         return
@@ -316,10 +387,8 @@ class _ParallelRangeStream(Iterator[bytes]):
             finally:
                 try:
                     if response is not None:
-                        response.close()
+                        self._responses.close(response)
                 finally:
-                    with self._condition:
-                        self._responses.pop(response, None)
                     self._gate.release()
             if self._stop.is_set():
                 return
@@ -327,23 +396,17 @@ class _ParallelRangeStream(Iterator[bytes]):
                 raise FUSError(f"range {buffer.start}-{buffer.end} failed: {retry_error}") from retry_error
             if isinstance(retry_error, RateLimitedError):
                 continue
-            if self._recover_download is not None and attempt % _DOWNLOAD_RECOVERY_INTERVAL == 0:
-                self._recover_download()
-                if self._stop.wait(_RATE_LIMIT_COOLDOWN_S):
-                    return
             if self._stop.wait(_RETRY_BACKOFF_S * attempt):
                 return
 
-    def close(self) -> None:
+    def cancel(self) -> None:
         with self._condition:
             self._stop.set()
-            responses = list(self._responses.items())
             self._condition.notify_all()
-        for response, sock in responses:
-            if sock is not None:
-                with suppress(OSError):
-                    sock.shutdown(socket.SHUT_RDWR)
-            response.close()
+        self._responses.cancel()
+
+    def close(self) -> None:
+        self.cancel()
         deadline = time.monotonic() + 1.0
         for thread in self._threads:
             thread.join(max(0, deadline - time.monotonic()))

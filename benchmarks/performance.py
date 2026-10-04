@@ -34,7 +34,14 @@ def load_baseline(path, reference, constants=None):
     module = types.ModuleType(name)
     module.__package__ = name.rsplit(".", 1)[0]
     sys.modules[name] = module
-    exec(compile(source, path, "exec"), vars(module))
+    original_constants = sys.modules.get("asgard.core.constants")
+    if constants is not None:
+        sys.modules["asgard.core.constants"] = constants
+    try:
+        exec(compile(source, path, "exec"), vars(module))
+    finally:
+        if constants is not None:
+            sys.modules["asgard.core.constants"] = original_constants
     if constants is not None:
         for key, value in vars(constants).items():
             if key.startswith("_") and not key.startswith("__") and hasattr(module, key):
@@ -150,7 +157,7 @@ def image_benchmark():
     return results
 
 
-def parallel_stream_benchmark(size_mib=96, mib_per_second=16):
+def parallel_stream_benchmark(size_mib=96, mib_per_second=16, *, compare_ranges=False, first_range_factor=1.0):
     key = bytes(range(16))
     plain = random.Random(31).randbytes(size_mib * 1024 * 1024)
     expected_digest = hashlib.sha256(plain).hexdigest()
@@ -158,6 +165,7 @@ def parallel_stream_benchmark(size_mib=96, mib_per_second=16):
     lock = threading.Lock()
     active = 0
     max_active = 0
+    requests = 0
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -172,7 +180,7 @@ def parallel_stream_benchmark(size_mib=96, mib_per_second=16):
                 pass
 
         def do_GET(self):
-            nonlocal active, max_active
+            nonlocal active, max_active, requests
             start, end = map(int, re.fullmatch(r"bytes=(\d+)-(\d+)", self.headers["Range"]).groups())
             self.send_response(206)
             self.send_header("Content-Range", f"bytes {start}-{end}/{len(encrypted)}")
@@ -180,12 +188,14 @@ def parallel_stream_benchmark(size_mib=96, mib_per_second=16):
             self.end_headers()
             with lock:
                 active += 1
+                requests += 1
                 max_active = max(max_active, active)
             try:
                 deadline = time.perf_counter()
+                rate = mib_per_second * (first_range_factor if start == 0 else 1.0)
                 for offset in range(start, end + 1, 65536):
                     chunk = memoryview(encrypted)[offset : min(end + 1, offset + 65536)]
-                    deadline += len(chunk) / (mib_per_second * 1024 * 1024)
+                    deadline += len(chunk) / (rate * 1024 * 1024)
                     time.sleep(max(0, deadline - time.perf_counter()))
                     self.wfile.write(chunk)
                     self.wfile.flush()
@@ -200,10 +210,21 @@ def parallel_stream_benchmark(size_mib=96, mib_per_second=16):
     thread.start()
     original_url = client_module._FUS_DOWNLOAD_URL
     client_module._FUS_DOWNLOAD_URL = f"http://127.0.0.1:{server.server_port}/download"
-    results = {"source": "local HTTP server", "per_connection_mib_s": mib_per_second, "size_mib": size_mib}
+    results = {
+        "source": "local HTTP server",
+        "per_connection_mib_s": mib_per_second,
+        "first_range_factor": first_range_factor,
+        "size_mib": size_mib,
+    }
     try:
-        for workers in (1, 6):
+        modes = (
+            (("fixed_ranges", 6, False), ("adaptive_ranges", 6, True))
+            if compare_ranges
+            else (("1_connections", 1, True), ("6_connections", 6, True))
+        )
+        for label, workers, adaptive in modes:
             max_active = 0
+            requests = 0
             digest = hashlib.sha256()
             started = time.perf_counter()
             with (
@@ -215,6 +236,7 @@ def parallel_stream_benchmark(size_mib=96, mib_per_second=16):
                     key=key,
                     stream_chunk_size=1024 * 1024,
                     threads=workers,
+                    adaptive_ranges=adaptive,
                 ) as reader,
                 reader.streaming(),
             ):
@@ -222,10 +244,11 @@ def parallel_stream_benchmark(size_mib=96, mib_per_second=16):
                     digest.update(chunk)
             elapsed = time.perf_counter() - started
             assert digest.hexdigest() == expected_digest
-            results[f"{workers}_connections"] = {
+            results[label] = {
                 "seconds": round(elapsed, 3),
                 "ordered_mib_s": round(size_mib / elapsed, 2),
                 "max_active": max_active,
+                "requests": requests,
                 "sha256": digest.hexdigest(),
             }
     finally:
@@ -241,7 +264,18 @@ def main():
     parser.add_argument("--baseline", default="HEAD")
     parser.add_argument("--latency-ms", default=50.0, type=float)
     parser.add_argument("--parallel-stream-only", action="store_true")
+    parser.add_argument("--compare-ranges", action="store_true")
+    parser.add_argument("--first-range-factor", type=float, default=1.0)
     args = parser.parse_args()
+    if not 0 < args.first_range_factor <= 1:
+        parser.error("--first-range-factor must be greater than zero and at most one")
+    if args.compare_ranges:
+        print(
+            json.dumps(
+                parallel_stream_benchmark(compare_ranges=True, first_range_factor=args.first_range_factor), indent=2
+            )
+        )
+        return
     if args.parallel_stream_only:
         print(json.dumps(parallel_stream_benchmark(), indent=2))
         return
