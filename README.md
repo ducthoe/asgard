@@ -135,6 +135,10 @@ images.
 
 ## Transfer speed and resuming
 
+Progress shows a bar, transfer speed, and ETA when the total is known.
+Extraction keeps separate download and decode rows. Unknown download totals
+show an activity bar; stalled transfers show `ETA --:--` until data resumes.
+
 Downloads use up to six connections by default, including archive, image,
 partition, and OTA base-image extraction. `--threads N` changes this limit;
 use `--threads 1` for a single connection. Small transfers and metadata reads

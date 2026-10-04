@@ -409,7 +409,7 @@ def download_firmware(
 
         decrypt_key = _decryption_key_from_info(info, model_u, region_u)
         if done_before < info.size:
-            with PipelineProgress() as progress:
+            with PipelineProgress(download_total=info.size, initial_download=done_before) as progress:
                 _download_ranges_parallel(
                     client=client,
                     remote_path=remote_path,

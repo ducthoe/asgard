@@ -8,7 +8,6 @@ import shutil
 import sys
 import threading
 import time
-from collections import deque
 from contextvars import ContextVar
 
 from ..core.constants import _PROGRESS_REFRESH_S
@@ -69,22 +68,18 @@ def display_message(message: str) -> bool:
         return True
 
 
-def _speed(samples, now: float, done: int) -> float:
-    samples.append((now, done))
-    while len(samples) > 2 and samples[1][0] <= now - 2.0:
-        samples.popleft()
-    started_at, initial = samples[0]
-    return max(0, done - initial) / max(now - started_at, 0.001)
-
-
 class PipelineProgress:
-    def __init__(self):
-        self.received = 0
+    def __init__(self, *, download_total: int | None = None, initial_download: int = 0):
+        from .progress import ProgressRate
+
+        self.received = initial_download
+        self.download_total = download_total or 0
         self.started_at = time.monotonic()
         self.decoding = None
         self.enabled = False
-        self.download_samples = deque([(self.started_at, 0)])
-        self.decode_samples = deque()
+        self.download_rate = ProgressRate(self.started_at, initial_download)
+        self.decode_rate = None
+        self.finished = False
         self.stop = threading.Event()
         self.refresh_thread = None
 
@@ -116,8 +111,9 @@ class PipelineProgress:
             if self.enabled:
                 with _LOCK:
                     _erase()
-                    lines = self.lines(time.monotonic())
+                    self.finished = kind is None
                     status = "stopped" if kind is not None else "finished"
+                    lines = self.lines(time.monotonic(), reserve=len(status) + 3)
                     width = max(1, shutil.get_terminal_size().columns - 1)
                     print("\n".join(f"{line} ({status})"[:width] for line in lines), flush=True)
                     _ACTIVE.remove(self)
@@ -136,26 +132,34 @@ class PipelineProgress:
                 _draw()
 
     def update_decode(self, label, done, total, started_at, *, speed_done=None, complete=False) -> None:
+        from .progress import ProgressRate
+
         if self.enabled:
             with _LOCK:
                 if self.decoding is None or (self.decoding[0], self.decoding[3]) != (label, started_at):
-                    self.decode_samples.clear()
-                    self.decode_samples.append((started_at, done - speed_done if speed_done is not None else 0))
-                self.decoding = (label, done, total, started_at, speed_done)
+                    self.decode_rate = ProgressRate(started_at, done - speed_done if speed_done is not None else 0)
+                self.decoding = (label, done, total, started_at, speed_done, complete)
                 _draw(force=complete)
 
-    def lines(self, now: float) -> tuple[str, str]:
-        from .progress import format_bytes
+    def lines(self, now: float, *, reserve: int = 0) -> tuple[str, str]:
+        from .progress import progress_line
 
-        speed = _speed(self.download_samples, now, self.received)
-        download = f"Download: {format_bytes(speed) + '/s':>13}  {format_bytes(self.received)} received"
+        width = max(1, shutil.get_terminal_size(fallback=(80, 24)).columns - 1 - reserve)
+        speed, eta_speed = self.download_rate.update(now, self.received)
+        download = progress_line(
+            "Download",
+            self.received,
+            self.download_total,
+            speed,
+            eta_speed,
+            now=now,
+            width=width,
+            complete=self.finished,
+        )
         if self.decoding is None:
             return download, "Decode: waiting for data"
-        label, done, total, _started_at, _speed_done = self.decoding
-        speed = _speed(self.decode_samples, now, done)
-        if total > 0:
-            fraction = min(1.0, max(0.0, done / total))
-            amount = f"{fraction * 100:6.2f}% {format_bytes(done)}/{format_bytes(total)}"
-        else:
-            amount = format_bytes(done)
-        return download, f"Decode:   {format_bytes(speed) + '/s':>13}  {amount} ({label})"
+        label, done, total, _started_at, _speed_done, complete = self.decoding
+        speed, eta_speed = self.decode_rate.update(now, done)
+        return download, progress_line(
+            "Decode", done, total, speed, eta_speed, now=now, width=width, complete=complete, detail=label
+        )
