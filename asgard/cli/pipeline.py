@@ -144,7 +144,7 @@ class PipelineProgress:
     def lines(self, now: float, *, reserve: int = 0) -> tuple[str, str]:
         from .progress import progress_line
 
-        width = max(1, shutil.get_terminal_size(fallback=(80, 24)).columns - 1 - reserve)
+        width = max(1, shutil.get_terminal_size(fallback=(80, 24)).columns - 1)
         speed, eta_speed = self.download_rate.update(now, self.received)
         download = progress_line(
             "Download",
@@ -155,11 +155,23 @@ class PipelineProgress:
             now=now,
             width=width,
             complete=self.finished,
+            reserve=reserve,
         )
         if self.decoding is None:
-            return download, "Decode: waiting for data"
+            return download, progress_line(
+                "Decode", 0, 0, 0, 0, now=now, width=width, detail="waiting for data", reserve=reserve
+            )
         label, done, total, _started_at, _speed_done, complete = self.decoding
         speed, eta_speed = self.decode_rate.update(now, done)
         return download, progress_line(
-            "Decode", done, total, speed, eta_speed, now=now, width=width, complete=complete, detail=label
+            "Decode",
+            done,
+            total,
+            speed,
+            eta_speed,
+            now=now,
+            width=width,
+            complete=complete,
+            detail=label,
+            reserve=reserve,
         )

@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict, deque
+from functools import lru_cache
 
 from .pipeline import current_pipeline, display_message
 
@@ -89,6 +90,33 @@ def _eta(done: int, total: int, speed: float, complete: bool) -> str:
     return f"{hours:02}:{minutes:02}:{seconds:02}" if hours else f"{minutes:02}:{seconds:02}"
 
 
+@lru_cache(maxsize=4)
+def _bar_symbols(encoding: str) -> tuple[str, str, str]:
+    try:
+        "█░".encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return "=", "-", ""
+    try:
+        "▏▎▍▌▋▊▉".encode(encoding)
+        partials = "▏▎▍▌▋▊▉"
+    except UnicodeEncodeError:
+        partials = "▌" if "▌".encode(encoding, errors="ignore") else ""
+    return "█", "░", partials
+
+
+def _shorten(text: str, width: int) -> str:
+    if len(text) <= width:
+        return text
+    return text[: width - 3] + "..." if width > 3 else text[:width]
+
+
+def _compact_amount(done: int, total: int) -> str:
+    total_text = format_bytes(total)
+    number, unit = total_text.split()
+    divisor = 1024 ** ("B", "KiB", "MiB", "GiB", "TiB").index(unit)
+    return f"{done / divisor:.2f}/{number} {unit}"
+
+
 def progress_line(
     label: str,
     done: int,
@@ -100,36 +128,51 @@ def progress_line(
     width: int,
     complete: bool = False,
     detail: str = "",
+    reserve: int = 0,
 ) -> str:
     width = max(1, width)
-    label_width = max(4, min(24, width // 4))
-    if len(label) > label_width:
-        label = label[: label_width - 3] + "..."
+    bar_width = max(3, min(40, width - 68))
+    bar_start = max(0, (width - bar_width - 2) // 2)
+    left_width = max(0, bar_start - 1)
+    right_width = max(0, width - bar_start - bar_width - 3 - reserve)
     fraction = min(1.0, max(0.0, done / total)) if total > 0 else None
     percent = f"{fraction * 100:5.1f}%" if fraction is not None else ""
     amount = f"{format_bytes(done)}/{format_bytes(total)}" if total > 0 else format_bytes(done)
-    ending = f"{format_bytes(speed)}/s ETA {_eta(done, total, eta_speed, complete)}"
     prefix = f"{label}: "
-    parts = [part for part in (percent, amount, ending) if part]
-    if len(prefix) + len(" ".join(parts)) + 9 > width:
-        parts = [part for part in (percent, ending) if part]
-    if len(prefix) + len(" ".join(parts)) + 9 > width:
-        parts = [part for part in (percent, f"ETA {_eta(done, total, eta_speed, complete)}") if part]
-    bar_width = max(3, min(32, width - len(prefix) - len(" ".join(parts)) - 3))
+    if total > 0 and len(prefix) + len(amount) > left_width:
+        amount = _compact_amount(done, total)
+    if len(prefix) + len(amount) > left_width:
+        amount = format_bytes(done)
+    left = prefix + amount if len(prefix) + len(amount) <= left_width else _shorten(label, left_width)
+    eta = _eta(done, total, eta_speed, complete)
+    candidates = (
+        " ".join(part for part in (percent, f"{format_bytes(speed)}/s", f"ETA {eta}") if part),
+        " ".join(part for part in (percent, f"ETA {eta}") if part),
+        f"ETA {eta}",
+        eta,
+    )
+    right = next((text for text in candidates if len(text) <= right_width), eta[:right_width])
+    if detail and right_width - len(right) >= 11:
+        right += f" ({_shorten(detail, right_width - len(right) - 3)})"
+    filled_symbol, empty_symbol, partials = _bar_symbols(sys.stdout.encoding or "utf-8")
     if fraction is not None or complete:
         filled = int(fraction * bar_width) if fraction is not None else bar_width
-        bar = "#" * filled + "-" * (bar_width - filled)
+        partial = ""
+        if fraction is not None and filled < bar_width and partials:
+            part = int((fraction * bar_width - filled) * (len(partials) + 1))
+            if part:
+                partial = partials[part - 1]
+        bar = filled_symbol * filled + partial + empty_symbol * (bar_width - filled - len(partial))
     elif speed > 0:
-        step = int(now * 3) % max(1, 2 * (bar_width - 1))
-        position = min(step, 2 * (bar_width - 1) - step)
-        bar = " " * position + ">" + " " * (bar_width - position - 1)
+        pulse = min(3, max(1, bar_width // 4))
+        travel = bar_width - pulse
+        step = int(now * 3) % max(1, 2 * travel)
+        position = min(step, 2 * travel - step)
+        bar = empty_symbol * position + filled_symbol * pulse + empty_symbol * (bar_width - position - pulse)
     else:
-        bar = "-" * bar_width
-    line = prefix + f"[{bar}] " + " ".join(parts)
-    if detail and len(line) + 4 < width:
-        available = width - len(line) - 3
-        line += f" ({detail[:available]})"
-    return line[:width]
+        bar = empty_symbol * bar_width
+    line = left.ljust(bar_start) + f"[{bar}]" + (f" {right}" if right else "")
+    return line[: max(0, width - reserve)]
 
 
 def render_progress(
