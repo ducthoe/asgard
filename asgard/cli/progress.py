@@ -131,9 +131,9 @@ def progress_line(
     reserve: int = 0,
 ) -> str:
     width = max(1, width)
-    bar_width = max(3, min(40, width - 68))
-    bar_start = max(0, (width - bar_width - 2) // 2)
-    left_width = max(0, bar_start - 1)
+    left_width = max(0, min(32, (width - 7) // 2))
+    bar_start = left_width + 1 if left_width else 0
+    bar_width = max(3, min(40, width - bar_start - 35))
     right_width = max(0, width - bar_start - bar_width - 3 - reserve)
     fraction = min(1.0, max(0.0, done / total)) if total > 0 else None
     percent = f"{fraction * 100:5.1f}%" if fraction is not None else ""
