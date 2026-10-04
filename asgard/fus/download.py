@@ -42,7 +42,7 @@ from .resume import (
     _save_range_resume_state,
 )
 from .scheduling import AdaptiveDownloadGate, split_download_ranges
-from .streaming import BandwidthLimiter, _validate_content_range
+from .transfer import BandwidthLimiter, _validate_content_range
 
 
 def _download_output_path(
@@ -122,8 +122,8 @@ def _download_ranges_parallel(
     worker_limit = min(workers, len(pending_ranges))
     gate = AdaptiveDownloadGate(worker_limit) if worker_limit else None
     chunk_size = _DOWNLOAD_CHUNK_SIZE
-    if rate_limiter is not None and rate_limiter.rate > 0:
-        chunk_size = min(chunk_size, max(_AES_BLOCK_SIZE, int(rate_limiter.rate * _PROGRESS_REFRESH_S)))
+    if rate_limiter is not None:
+        chunk_size = rate_limiter.chunk_size(chunk_size)
 
     def write_chunk(fh, data: bytes | memoryview) -> None:
         view = memoryview(data)

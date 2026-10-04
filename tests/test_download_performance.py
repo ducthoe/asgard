@@ -25,7 +25,7 @@ from asgard.cli.app import _build_parser, _handle_download
 from asgard.core.errors import FUSError
 from asgard.formats import archive as archive_module
 from asgard.fus import client as client_module
-from asgard.fus import download, scheduling, streaming
+from asgard.fus import download, scheduling, streaming, transfer
 from asgard.fus.client import FUSClient
 from asgard.fus.models import BinaryInfo
 from asgard.fus.resume import _prepare_range_resume_state, _resume_done_bytes
@@ -38,6 +38,11 @@ KEY = bytes(range(16))
 def encrypt(data):
     padding = 16 - len(data) % 16
     return AES.new(KEY, AES.MODE_ECB).encrypt(data + bytes([padding]) * padding)
+
+
+def set_stream_range_size(monkeypatch, size):
+    for module in (streaming, transfer):
+        monkeypatch.setattr(module, "_DOWNLOAD_MIN_RANGE_SIZE", size)
 
 
 def super_image(plain):
@@ -174,6 +179,7 @@ def server(monkeypatch):
     monkeypatch.setattr(scheduling, "_DOWNLOAD_REQUEST_INTERVAL_S", 0)
     monkeypatch.setattr(scheduling, "_RATE_LIMIT_COOLDOWN_S", 0.02)
     monkeypatch.setattr(streaming, "_RETRY_BACKOFF_S", 0)
+    monkeypatch.setattr(transfer, "_RETRY_BACKOFF_S", 0)
     monkeypatch.setattr(download, "_RETRY_BACKOFF_S", 0)
     monkeypatch.setattr(download, "_render_progress", lambda *args, **kwargs: None)
     try:
@@ -287,7 +293,7 @@ def test_remote_zip_entries_remain_valid(server):
 
 @pytest.mark.parametrize("threads", [None, 1, 2, 6])
 def test_parallel_stream_delivers_out_of_order_ranges_in_order(server, monkeypatch, threads):
-    monkeypatch.setattr(streaming, "_DOWNLOAD_MIN_RANGE_SIZE", 256 * 1024)
+    set_stream_range_size(monkeypatch, 256 * 1024)
     plain = random.Random(30).randbytes(3 * 1024 * 1024 + 113)
     server.data = encrypt(plain)
     server.chunk_delay = 0.005
@@ -327,7 +333,7 @@ def test_parallel_stream_delivers_out_of_order_ranges_in_order(server, monkeypat
 
 def test_parallel_stream_bounds_read_ahead_when_consumer_pauses(server, monkeypatch):
     range_size = 256 * 1024
-    monkeypatch.setattr(streaming, "_DOWNLOAD_MIN_RANGE_SIZE", range_size)
+    set_stream_range_size(monkeypatch, range_size)
     plain = random.Random(31).randbytes(4 * 1024 * 1024)
     server.data = encrypt(plain)
     received = []
@@ -357,7 +363,7 @@ def test_parallel_stream_bounds_read_ahead_when_consumer_pauses(server, monkeypa
 
 
 def test_parallel_stream_resumes_partial_ranges_without_refetching(server, monkeypatch):
-    monkeypatch.setattr(streaming, "_DOWNLOAD_MIN_RANGE_SIZE", 256 * 1024)
+    set_stream_range_size(monkeypatch, 256 * 1024)
     plain = random.Random(32).randbytes(2 * 1024 * 1024)
     server.data = encrypt(plain)
     received = []
@@ -381,7 +387,7 @@ def test_parallel_stream_resumes_partial_ranges_without_refetching(server, monke
 
 
 def test_parallel_stream_cancels_stalled_connections(server, monkeypatch):
-    monkeypatch.setattr(streaming, "_DOWNLOAD_MIN_RANGE_SIZE", 256 * 1024)
+    set_stream_range_size(monkeypatch, 256 * 1024)
     server.data = encrypt(random.Random(33).randbytes(2 * 1024 * 1024))
     with FUSClient() as client:
         reader = _FUSDecryptingReader(client=client, remote_path="test", encrypted_size=len(server.data), key=KEY)
@@ -401,7 +407,7 @@ def test_parallel_stream_cancels_stalled_connections(server, monkeypatch):
 
 @pytest.mark.parametrize("status", [429, 503])
 def test_parallel_stream_honors_shared_throttle_cooldown(server, monkeypatch, status):
-    monkeypatch.setattr(streaming, "_DOWNLOAD_MIN_RANGE_SIZE", 256 * 1024)
+    set_stream_range_size(monkeypatch, 256 * 1024)
     monkeypatch.setattr(scheduling, "_DOWNLOAD_REQUEST_INTERVAL_S", 0.025)
     plain = random.Random(34).randbytes(2 * 1024 * 1024)
     server.data = encrypt(plain)
@@ -433,7 +439,7 @@ def test_default_gate_allows_six_concurrent_connections(server):
 @pytest.mark.parametrize("mode", ["archive", "file", "partition"])
 @pytest.mark.parametrize("threads", [None, 2])
 def test_archive_extraction_api_uses_requested_connections(server, tmp_path, monkeypatch, compression, mode, threads):
-    monkeypatch.setattr(streaming, "_DOWNLOAD_MIN_RANGE_SIZE", 256 * 1024)
+    set_stream_range_size(monkeypatch, 256 * 1024)
     plain = random.Random(35).randbytes(3 * 1024 * 1024)
     member_name = "super.img.lz4" if mode == "partition" else "boot.img.lz4"
     compressed = lz4_frame.compress(super_image(plain) if mode == "partition" else plain, content_checksum=True)
@@ -483,7 +489,7 @@ def test_archive_extraction_api_uses_requested_connections(server, tmp_path, mon
 
 
 def test_parallel_extraction_recovers_expired_auth_once(server, monkeypatch):
-    monkeypatch.setattr(streaming, "_DOWNLOAD_MIN_RANGE_SIZE", 256 * 1024)
+    set_stream_range_size(monkeypatch, 256 * 1024)
     plain = random.Random(36).randbytes(2 * 1024 * 1024)
     server.data = encrypt(plain)
     with FUSClient() as client:
@@ -502,7 +508,7 @@ def test_parallel_extraction_recovers_expired_auth_once(server, monkeypatch):
 
 
 def test_small_archive_extraction_does_not_prefetch_the_following_archive(server, tmp_path, monkeypatch):
-    monkeypatch.setattr(streaming, "_DOWNLOAD_MIN_RANGE_SIZE", 256 * 1024)
+    set_stream_range_size(monkeypatch, 256 * 1024)
     plain = random.Random(38).randbytes(65536)
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w") as archive:
@@ -519,8 +525,8 @@ def test_small_archive_extraction_does_not_prefetch_the_following_archive(server
 
 
 def test_parallel_extraction_rejects_wrong_ranges_and_closes_connections(server, monkeypatch):
-    monkeypatch.setattr(streaming, "_DOWNLOAD_MIN_RANGE_SIZE", 256 * 1024)
-    monkeypatch.setattr(streaming, "_DOWNLOAD_RETRIES", 1)
+    set_stream_range_size(monkeypatch, 256 * 1024)
+    monkeypatch.setattr(transfer, "_DOWNLOAD_RETRIES", 1)
     server.data = encrypt(random.Random(37).randbytes(2 * 1024 * 1024))
     with (
         FUSClient() as client,
@@ -802,7 +808,7 @@ def test_retry_after_is_respected(server, tmp_path, status):
 def test_wrong_ranges_are_rejected(server, monkeypatch):
     server.data = bytes(65536)
     server.bad_range = True
-    monkeypatch.setattr(streaming, "_DOWNLOAD_RETRIES", 0)
+    monkeypatch.setattr(transfer, "_DOWNLOAD_RETRIES", 0)
     with FUSClient() as client, pytest.raises(FUSError, match="wrong byte range"):
         _read_download_range(client=client, remote_path="test", start=0, end=65535, total_size=65536)
 

@@ -520,7 +520,7 @@ def _load_batch(path_value: str) -> list[dict[str, Any]]:
                 payload = tomllib.load(source)
     except (json.JSONDecodeError, ValueError) as exc:
         raise FUSError(f"invalid batch file {path}: {exc}") from exc
-    jobs = payload if isinstance(payload, list) else payload.get("downloads") if isinstance(payload, dict) else None
+    jobs = payload.get("downloads") if isinstance(payload, dict) else payload
     if not isinstance(jobs, list) or any(not isinstance(job, dict) for job in jobs):
         raise FUSError("batch file must contain a 'downloads' array/table")
     return jobs
@@ -551,6 +551,7 @@ def _handle_batch(args: argparse.Namespace) -> int:
                 job_rate = job.get("limit_rate", args.limit_rate)
                 if isinstance(job_rate, str):
                     job_rate = _parse_byte_rate(job_rate)
+                job_threads = job.get("threads", args.threads)
                 result = fus.download_firmware(
                     model=model,
                     region=region,
@@ -559,7 +560,7 @@ def _handle_batch(args: argparse.Namespace) -> int:
                     out_file=out_file,
                     resume=bool(job.get("resume", True)),
                     auto_decrypt=bool(job.get("decrypt", False)),
-                    threads=int(job.get("threads", args.threads)) if job.get("threads", args.threads) else None,
+                    threads=int(job_threads) if job_threads else None,
                     timeout_s=int(job.get("timeout", args.timeout)),
                     rate_limit=int(job_rate) if job_rate else None,
                 )
@@ -949,7 +950,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "checkupdate":
             model, region = _resolve_args_device(args)
             version = fus.get_latest_version(model, region, timeout_s=args.timeout)
-            _json_print({"model": model, "region": region, "firmware": version}) if args.json else print(version)
+            if args.json:
+                _json_print({"model": model, "region": region, "firmware": version})
+            else:
+                print(version)
             return 0
         if args.command == "history":
             model, region = _resolve_args_device(args)

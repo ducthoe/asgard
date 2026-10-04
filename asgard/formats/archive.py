@@ -708,14 +708,23 @@ def _open_cached_tar_member(
 
 
 @contextmanager
+def _open_firmware_entry(
+    remote: _RemoteFirmwareArchive,
+    entry: zipfile.ZipInfo,
+) -> Iterator[zipfile.ZipExtFile]:
+    with (
+        remote.reader.streaming(end=entry.header_offset + _ZIP_MAX_HEADER_SIZE + entry.compress_size),
+        remote.archive.open(entry, "r") as source,
+    ):
+        yield source
+
+
+@contextmanager
 def _open_firmware_tar(
     remote: _RemoteFirmwareArchive,
     outer_entry: zipfile.ZipInfo,
 ) -> Iterator[tarfile.TarFile]:
-    with (
-        remote.reader.streaming(end=outer_entry.header_offset + _ZIP_MAX_HEADER_SIZE + outer_entry.compress_size),
-        remote.archive.open(outer_entry, "r") as entry_source,
-    ):
+    with _open_firmware_entry(remote, outer_entry) as entry_source:
         mode = "r:" if outer_entry.compress_type == zipfile.ZIP_STORED else "r|"
         source_context = (
             nullcontext(entry_source)
@@ -1432,10 +1441,7 @@ def download_firmware_entries(
                 if initial_size == entry.file_size:
                     done = initial_size
                 else:
-                    with (
-                        remote.reader.streaming(end=entry.header_offset + _ZIP_MAX_HEADER_SIZE + entry.compress_size),
-                        remote.archive.open(entry, "r") as source,
-                    ):
+                    with _open_firmware_entry(remote, entry) as source:
                         if initial_size:
                             _discard_stream(source, initial_size, entry.filename)
                         with (

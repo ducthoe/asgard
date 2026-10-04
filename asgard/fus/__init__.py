@@ -6,7 +6,7 @@ from __future__ import annotations
 from importlib import import_module
 
 _EXPORTS = {
-    "BandwidthLimiter": (".streaming", "BandwidthLimiter"),
+    "BandwidthLimiter": (".transfer", "BandwidthLimiter"),
     "BinaryInfo": (".models", "BinaryInfo"),
     "DownloadResult": (".models", "DownloadResult"),
     "FUSError": ("..core.errors", "FUSError"),
