@@ -698,6 +698,7 @@ def extract_super_partitions(
     output_dir: Path,
     slot_fallback: bool = False,
     allow_missing: bool = False,
+    resume: bool = False,
 ) -> tuple[Path, ...]:
     with _open_super_image_reader(
         source,
@@ -709,6 +710,34 @@ def extract_super_partitions(
         if not selected:
             return ()
         spans, sizes = _build_super_copy_plan(metadata, selected, reader)
+        destinations: list[Path] = []
+        paths: dict[str, tuple[Path, Path]] = {}
+        for partition in selected:
+            destination = output_dir / f"{partition.name}.img"
+            destinations.append(destination)
+            if destination.exists():
+                if not resume:
+                    raise FUSError(f"{destination} already exists")
+                if not destination.is_file():
+                    raise FUSError(f"{destination} is not a regular file")
+                actual_size = destination.stat().st_size
+                if actual_size != sizes[partition.name]:
+                    raise FUSError(
+                        f"{destination} has an unexpected size: expected {sizes[partition.name]} bytes, got {actual_size}"
+                    )
+                continue
+            part_path = destination.with_name(f"{destination.name}.part")
+            if part_path.exists() and not resume:
+                raise FUSError(f"{part_path} already exists")
+            paths[partition.name] = destination, part_path
+        if not paths:
+            return tuple(destinations)
+        if resume:
+            # Extraction restarts from the cached super image; keep completed outputs.
+            for _destination, part_path in paths.values():
+                part_path.unlink(missing_ok=True)
+        selected = tuple(partition for partition in selected if partition.name in paths)
+        spans = tuple(span for span in spans if span.partition_name in paths)
         progress_start = reader.tell()
         progress_end = spans[-1].source_offset + spans[-1].size if spans else progress_start
         progress_total = progress_end - progress_start
@@ -735,16 +764,6 @@ def extract_super_partitions(
                 complete=complete,
             )
             progress_last_render = now
-
-        paths: dict[str, tuple[Path, Path]] = {}
-        for partition in selected:
-            destination = output_dir / f"{partition.name}.img"
-            paths[partition.name] = destination, destination.with_name(f"{destination.name}.part")
-        for destination, part_path in paths.values():
-            if destination.exists():
-                raise FUSError(f"{destination} already exists")
-            if part_path.exists():
-                raise FUSError(f"{part_path} already exists")
 
         renamed: list[Path] = []
         complete = False
@@ -798,7 +817,7 @@ def extract_super_partitions(
                 part_path.replace(destination)
                 renamed.append(destination)
             complete = True
-            return tuple(paths[partition.name][0] for partition in selected)
+            return tuple(destinations)
         finally:
             if not complete:
                 for _destination, part_path in paths.values():

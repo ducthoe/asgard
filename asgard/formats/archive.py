@@ -1342,16 +1342,6 @@ def download_firmware_super_partitions(
             label=f"Caching {stage_name}",
         )
         with source_part.open("rb") as local_source:
-            available = list_super_partitions(local_source, name, size)
-        selected_names = tuple(partition.name for partition in available) if requested is None else tuple(requested)
-        destinations = tuple(output_dir / f"{partition_name}.img" for partition_name in selected_names)
-        existing = tuple(path.exists() for path in destinations)
-        if destinations and all(existing):
-            source_part.unlink(missing_ok=True)
-            return destinations
-        if any(existing):
-            raise FUSError("only some requested partition outputs exist; move them away before resuming")
-        with source_part.open("rb") as local_source:
             paths = extract_super_partitions(
                 local_source,
                 name,
@@ -1359,6 +1349,7 @@ def download_firmware_super_partitions(
                 requested=requested,
                 output_dir=output_dir,
                 slot_fallback=slot_fallback,
+                resume=True,
             )
         source_part.unlink(missing_ok=True)
         return paths
