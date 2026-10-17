@@ -25,6 +25,7 @@ from ..cli.pipeline import PipelineProgress, current_pipeline
 from ..cli.progress import format_bytes, print_info
 from ..core.constants import (
     _ARCHIVE_COPY_CHUNK_SIZE,
+    _SPARSE_MAGIC,
     _TAR_INDEX_MEMBER_BUFFER_SIZE,
     _TAR_INDEX_SCAN_BUFFER_SIZE,
     _TAR_INDEX_SPACING,
@@ -444,6 +445,46 @@ class _BoundedReader(io.RawIOBase):
             raise StreamSourceError
         self._remaining -= received
         return received
+
+
+class _ReplayedReader(io.RawIOBase):
+    """Serve bytes consumed while probing a stream, then continue with the stream."""
+
+    def __init__(self, source: io.BufferedIOBase, prefix: bytes):
+        super().__init__()
+        self._source = source
+        self._prefix = bytes(prefix)
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1) -> bytes:
+        self._checkClosed()
+        if size is None or size < 0:
+            head, self._prefix = self._prefix, b""
+            return head + self._source.read()
+        if not self._prefix:
+            return self._source.read(size)
+        head = self._prefix[:size]
+        self._prefix = self._prefix[len(head) :]
+        if len(head) == size:
+            return head
+        return head + self._source.read(size - len(head))
+
+    def readinto(self, buffer: bytearray | memoryview) -> int:
+        self._checkClosed()
+        if not buffer:
+            return 0
+        view = memoryview(buffer)
+        if not self._prefix:
+            return self._source.readinto(view)
+        amount = min(len(view), len(self._prefix))
+        view[:amount] = self._prefix[:amount]
+        self._prefix = self._prefix[amount:]
+        if amount == len(view):
+            return amount
+        received = self._source.readinto(view[amount:])
+        return amount + (received or 0)
 
 
 def _zip_entry_data_offset(remote: _RemoteFirmwareArchive, entry: zipfile.ZipInfo) -> int:
@@ -951,29 +992,19 @@ def download_firmware_tar_member(
         print_info(f"output: {destination}")
 
         output_complete = False
+        finished = False
         try:
 
-            def write_member(member_source: io.BufferedIOBase, member_size: int) -> None:
+            def cache_member(member_source: io.BufferedIOBase, member_size: int, label: str) -> Path:
+                """Cache the member so a rerun does not transfer it again."""
                 nonlocal source_part_path
-                if not resume:
-                    _write_firmware_tar_member(
-                        member_source,
-                        part_path,
-                        requested_name=requested_name,
-                        output_name=output_name,
-                        member_size=member_size,
-                        keep_sparse=keep_sparse,
-                    )
-                    return
                 source_part_path = destination.with_name(f".{destination.name}.{member_size}.asgard-source.part")
-                _copy_resumable_source(
-                    member_source,
-                    source_part_path,
-                    total_size=member_size,
-                    label=f"Caching {PurePosixPath(requested_name).name}",
-                )
+                _copy_resumable_source(member_source, source_part_path, total_size=member_size, label=label)
+                return source_part_path
+
+            def decode_cached(cached: Path, member_size: int) -> None:
                 part_path.unlink(missing_ok=True)
-                with source_part_path.open("rb") as local_source:
+                with cached.open("rb") as local_source:
                     _write_firmware_tar_member(
                         local_source,
                         part_path,
@@ -982,6 +1013,40 @@ def download_firmware_tar_member(
                         member_size=member_size,
                         keep_sparse=keep_sparse,
                     )
+
+            def write_member(member_source: io.BufferedIOBase, member_size: int) -> None:
+                nonlocal source_part_path, finished
+                name = PurePosixPath(requested_name).name
+                if resume and requested_name.lower().endswith(".lz4"):
+                    decode_cached(cache_member(member_source, member_size, f"Caching {name}"), member_size)
+                    return
+                if resume and member_size >= 4:
+                    prefix = member_source.read(4)
+                    if len(prefix) != 4:
+                        raise FUSError(f"truncated TAR member: {requested_name}")
+                    replayed = _ReplayedReader(member_source, prefix)
+                    if prefix == struct.pack("<I", _SPARSE_MAGIC) and not keep_sparse:
+                        # Expanding a sparse image is not appendable, so it needs the cached copy.
+                        decode_cached(cache_member(replayed, member_size, f"Caching {name}"), member_size)
+                        return
+                    # A plain member is copied byte for byte, so the cached member already is the
+                    # finished output: a rerun only appends the bytes still missing and the file is
+                    # renamed into place instead of being written a second time.
+                    cached = cache_member(replayed, member_size, f"Extracting {PurePosixPath(output_name).name}")
+                    if destination.exists():
+                        raise FUSError(f"{destination} already exists")
+                    cached.replace(destination)
+                    source_part_path = None
+                    finished = True
+                    return
+                _write_firmware_tar_member(
+                    member_source,
+                    part_path,
+                    requested_name=requested_name,
+                    output_name=output_name,
+                    member_size=member_size,
+                    keep_sparse=keep_sparse,
+                )
 
             member_copied = False
             cached: _TarIndexCache | None = None
@@ -1030,9 +1095,10 @@ def download_firmware_tar_member(
 
             if not member_copied:
                 raise FUSError(f"TAR member not found: {requested_name}")
-            if destination.exists():
-                raise FUSError(f"{destination} already exists")
-            part_path.replace(destination)
+            if not finished:
+                if destination.exists():
+                    raise FUSError(f"{destination} already exists")
+                part_path.replace(destination)
             if source_part_path is not None:
                 source_part_path.unlink(missing_ok=True)
             output_complete = True
