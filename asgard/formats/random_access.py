@@ -6,11 +6,14 @@ from __future__ import annotations
 import bisect
 import io
 import struct
+from collections.abc import Callable, Iterator
 from functools import lru_cache
 from typing import Protocol
 
 from ..core.errors import FUSError
 from .images import _read_lp_metadata, _select_lp_partitions
+
+_BLOCK_BATCH_BYTES = 1024 * 1024
 
 
 class ReadableImage(Protocol):
@@ -38,6 +41,44 @@ class ImageView:
         if len(data) != size:
             raise FUSError("truncated firmware image")
         return data
+
+
+def iter_file_blocks(
+    block_at: Callable[[int], int | None],
+    read_at: Callable[[int, int], bytes],
+    size: int,
+    block_size: int,
+    *,
+    max_bytes: int = _BLOCK_BATCH_BYTES,
+) -> Iterator[bytes]:
+    """Yield a file's bytes, merging physically contiguous blocks into single reads.
+
+    ``block_at(logical)`` returns the physical block number of a logical block, or
+    ``None`` for a hole or unwritten block. Merging runs keeps the number of reads
+    proportional to the number of extents instead of the number of blocks.
+    """
+    if block_size <= 0:
+        raise ValueError("block size must be positive")
+    full, tail = divmod(size, block_size)
+    span_limit = max(1, max_bytes // block_size)
+    logical = 0
+    while logical < full:
+        address = block_at(logical)
+        run = 1
+        while run < min(span_limit, full - logical):
+            following = block_at(logical + run)
+            if following is None:
+                if address is not None:
+                    break
+            elif address is None or following != address + run:
+                break
+            run += 1
+        amount = run * block_size
+        yield bytes(amount) if address is None else read_at(address * block_size, amount)
+        logical += run
+    if tail:
+        address = block_at(full)
+        yield bytes(tail) if address is None else read_at(address * block_size, tail)
 
 
 class CachedView:

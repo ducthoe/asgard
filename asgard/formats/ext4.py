@@ -9,7 +9,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 
 from ..core.errors import FUSError
-from .random_access import ReadableImage
+from .random_access import ReadableImage, iter_file_blocks
 
 
 def _u16(data: bytes, offset: int) -> int:
@@ -234,4 +234,12 @@ class Ext4:
         if inode.flags & 0x80000:
             yield from self._extent_data(inode)
             return
-        yield from self._data(inode)
+        if stat.S_ISLNK(inode.mode) and inode.size <= 60:
+            yield inode.block[: inode.size]
+            return
+        yield from iter_file_blocks(
+            lambda logical: self._legacy_block(inode, logical),
+            self.image.read_at,
+            inode.size,
+            self.block_size,
+        )

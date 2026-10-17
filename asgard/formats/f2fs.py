@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 
 from ..core.errors import FUSError
-from .random_access import ReadableImage
+from .random_access import ReadableImage, iter_file_blocks
 
 _BLOCK = 4096
 _DIRECT_INODE = 923
@@ -183,15 +183,19 @@ class F2FS:
         logical = 0
         while remaining:
             size = min(_BLOCK, remaining)
-            address = self._address(inode, logical)
-            if address in (0, 0xFFFFFFFF):
+            address = self._data_block(inode, logical)
+            if address is None:
                 yield bytes(size)
-            elif address == 0xFFFFFFFE:
-                raise FUSError("compressed F2FS cluster is not supported")
             else:
                 yield self.image.read_at(address * _BLOCK, size)
             logical += 1
             remaining -= size
+
+    def _data_block(self, inode: _Inode, logical: int) -> int | None:
+        address = self._address(inode, logical)
+        if address == 0xFFFFFFFE:
+            raise FUSError("compressed F2FS cluster is not supported")
+        return None if address in (0, 0xFFFFFFFF) else address
 
     @staticmethod
     def _dentry(block: bytes, target: bytes, inline: bool = False) -> int | None:
@@ -243,8 +247,12 @@ class F2FS:
         return inode
 
     def iter_file(self, inode: _Inode) -> Iterator[bytes]:
-        if not inode.inline_flags & 0x02:
-            first_node_block = _DIRECT_INODE - inode.extra_words - inode.inline_xattrs
-            for logical in range(first_node_block, (inode.size + _BLOCK - 1) // _BLOCK):
-                self._address(inode, logical)
-        yield from self._data(inode)
+        if inode.inline_flags & 0x02:
+            yield from self._data(inode)
+            return
+        yield from iter_file_blocks(
+            lambda logical: self._data_block(inode, logical),
+            self.image.read_at,
+            inode.size,
+            _BLOCK,
+        )

@@ -54,6 +54,7 @@ class FUSClient(FUSAuth):
         self._download_recovery: Callable[[], None] | None = None
         self._download_recovery_lock = threading.Lock()
         self._download_adapter: DownloadHTTPAdapter | None = None
+        self._download_pool_size = 0
 
     def __enter__(self) -> FUSClient:
         return self
@@ -63,15 +64,20 @@ class FUSClient(FUSAuth):
             self.session.close()
 
     def configure_download_pool(self, workers: int) -> None:
-        if self._owns_session:
-            self._download_adapter = DownloadHTTPAdapter(
-                pool_connections=2, pool_maxsize=max(1, workers), pool_block=True
-            )
-            self.session.mount(
-                _FUS_DOWNLOAD_URL,
-                self._download_adapter,
-            )
-            self.session.mount(_FUS_BASE_URL, self._download_adapter)
+        if not self._owns_session:
+            return
+        workers = max(1, int(workers))
+        # Keep the mounted adapter so pooled connections survive; replace it only when the
+        # requested pool is bigger than the one already installed.
+        if self._download_pool_size >= workers:
+            return
+        self._download_pool_size = workers
+        self._download_adapter = DownloadHTTPAdapter(pool_connections=2, pool_maxsize=workers, pool_block=True)
+        self.session.mount(
+            _FUS_DOWNLOAD_URL,
+            self._download_adapter,
+        )
+        self.session.mount(_FUS_BASE_URL, self._download_adapter)
 
     def cancel_downloads(self, stop_event: threading.Event) -> None:
         stop_event.set()
