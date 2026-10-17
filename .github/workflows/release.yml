@@ -1,0 +1,131 @@
+# Copyright (C) 2026 ducthoe
+# SPDX-License-Identifier: GPL-3.0-only
+
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to check against pyproject.toml (optional)
+        required: false
+        type: string
+      force:
+        description: Publish even when this version is already released
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Check version, test and build
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.version.outputs.changed }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install tools
+        run: python -m pip install --upgrade pip build packaging
+
+      - name: Check the version is new
+        id: version
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: python .github/scripts/check_release_version.py
+
+      - name: Install the package
+        run: python -m pip install -e . pytest
+
+      - name: Test
+        run: python -m pytest -q
+
+      - name: Build
+        run: python -m build
+
+      - name: Check the artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import glob
+          import os
+          import tarfile
+          import zipfile
+
+          version = os.environ["VERSION"]
+          wheels = glob.glob("dist/*.whl")
+          sdists = glob.glob("dist/*.tar.gz")
+          if len(wheels) != 1 or len(sdists) != 1:
+              raise SystemExit(f"expected one wheel and one sdist, got {wheels} and {sdists}")
+          for path in (wheels[0], sdists[0]):
+              if f"asgard_fus-{version}" not in path:
+                  raise SystemExit(f"{path} is not version {version}")
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          if any(name.startswith("tests/") for name in names):
+              raise SystemExit("the wheel contains tests")
+          if not any(name.endswith("licenses/LICENSE") for name in names):
+              raise SystemExit("the wheel does not contain the license")
+          with tarfile.open(sdists[0]) as archive:
+              if not any(name.endswith("/LICENSE") for name in archive.getnames()):
+                  raise SystemExit("the sdist does not contain the license")
+          print(f"dist holds asgard_fus-{version} wheel and sdist")
+          PY
+
+      - name: Summarise
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          CHANGED: ${{ steps.version.outputs.changed }}
+        run: |
+          {
+            echo "### Release check"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| version | \`$VERSION\` |"
+            echo "| publish | \`$CHANGED\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    if: needs.build.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/asgard-fus
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
