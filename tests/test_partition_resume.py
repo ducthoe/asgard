@@ -62,9 +62,13 @@ def firmware_super(request, monkeypatch):
         data = lz4_frame.compress(data, content_checksum=True)
         name += ".lz4"
     source = io.BytesIO(data)
-    monkeypatch.setattr(
-        archive_module, "_run_firmware_super_operation", lambda **kwargs: kwargs["operation"](source, name, len(data))
-    )
+
+    def run_operation(**kwargs):
+        # Each attempt in production opens the member stream from the start again.
+        source.seek(0)
+        return kwargs["operation"](source, name, len(data))
+
+    monkeypatch.setattr(archive_module, "_run_firmware_super_operation", run_operation)
     return partitions, data, name, source
 
 
@@ -102,23 +106,23 @@ def test_resume_keeps_completed_partitions_and_extracts_remaining(tmp_path, firm
     assert not list(tmp_path.glob("*.part"))
 
 
-@pytest.mark.parametrize("cache_complete", [False, True], ids=["partial-cache", "complete-cache"])
-def test_resume_restarts_interrupted_partition_from_cached_source(tmp_path, firmware_super, cache_complete):
+@pytest.mark.parametrize("stale_cache", [False, True], ids=["no-stale-cache", "stale-cache-ignored"])
+def test_resume_rebuilds_interrupted_partition_from_the_source_stream(tmp_path, firmware_super, stale_cache):
     partitions, data, name, source = firmware_super
     completed = tmp_path / "system_a.img"
     completed.write_bytes(partitions["system_a"])
     previous_stat = completed.stat()
-    partial = tmp_path / "system_ext_a.img.part"
-    partial.write_bytes(b"interrupted extraction")
-    source_cache = tmp_path / f".{name}.{len(data)}.asgard-source.part"
-    source_cache.write_bytes(data if cache_complete else data[: len(data) // 2])
+    (tmp_path / "system_ext_a.img.part").write_bytes(b"interrupted extraction")
+    if stale_cache:
+        (tmp_path / f".{name}.{len(data)}.asgard-source.part").write_bytes(data)
 
     paths = download(tmp_path)
 
     assert [path.read_bytes() for path in paths] == list(partitions.values())
     assert completed.stat().st_mtime_ns == previous_stat.st_mtime_ns
-    assert source.tell() == (0 if cache_complete else len(data))
-    assert not list(tmp_path.glob("*.part"))
+    assert not (tmp_path / "system_ext_a.img.part").exists()
+    # The source stream is read again rather than a cached copy being reused.
+    assert source.tell() > 0
 
 
 @pytest.mark.parametrize("existing", [b"", b"short", b"x" * 16384, None], ids=["empty", "short", "long", "directory"])
@@ -161,12 +165,11 @@ def test_resume_supports_slot_fallback(tmp_path, firmware_super):
     assert not list(tmp_path.glob("*.part"))
 
 
-def test_failed_resume_preserves_completed_outputs_and_source_cache(tmp_path, firmware_super, monkeypatch):
-    partitions, data, name, _source = firmware_super
+def test_failed_resume_preserves_completed_outputs_without_a_source_cache(tmp_path, firmware_super, monkeypatch):
+    partitions, _data, _name, _source = firmware_super
     completed = tmp_path / "system_a.img"
     completed.write_bytes(partitions["system_a"])
     previous_stat = completed.stat()
-    source_cache = tmp_path / f".{name}.{len(data)}.asgard-source.part"
 
     def interrupted_copy(*args, **kwargs):
         raise OSError("interrupted extraction")
@@ -179,9 +182,9 @@ def test_failed_resume_preserves_completed_outputs_and_source_cache(tmp_path, fi
 
     assert completed.read_bytes() == partitions["system_a"]
     assert completed.stat().st_mtime_ns == previous_stat.st_mtime_ns
-    assert source_cache.read_bytes() == data
     assert not (tmp_path / "system_ext_a.img.part").exists()
     assert not (tmp_path / "system_ext_a.img").exists()
+    assert not list(tmp_path.glob("*.asgard-source.part"))
 
     paths = download(tmp_path)
 

@@ -1390,35 +1390,15 @@ def download_firmware_super_partitions(
     output_dir = output_dir.resolve()
 
     def extract_operation(source: io.BufferedIOBase, name: str, size: int) -> tuple[Path, ...]:
-        if not resume:
-            return extract_super_partitions(
-                source,
-                name,
-                size,
-                requested=requested,
-                output_dir=output_dir,
-                slot_fallback=slot_fallback,
-            )
-        stage_name = PurePosixPath(name.replace("\\", "/")).name
-        source_part = output_dir / f".{stage_name}.{size}.asgard-source.part"
-        _copy_resumable_source(
+        return extract_super_partitions(
             source,
-            source_part,
-            total_size=size,
-            label=f"Caching {stage_name}",
+            name,
+            size,
+            requested=requested,
+            output_dir=output_dir,
+            slot_fallback=slot_fallback,
+            resume=resume,
         )
-        with source_part.open("rb") as local_source:
-            paths = extract_super_partitions(
-                local_source,
-                name,
-                size,
-                requested=requested,
-                output_dir=output_dir,
-                slot_fallback=slot_fallback,
-                resume=True,
-            )
-        source_part.unlink(missing_ok=True)
-        return paths
 
     return _run_firmware_super_operation(
         model=model,

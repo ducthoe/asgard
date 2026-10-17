@@ -111,11 +111,11 @@ super image can require downloading and decoding the data before it. A small
 output does not necessarily mean a small transfer.
 
 Without `--resume`, partition extraction streams the source without saving a
-local copy. With `--resume`, Asgard caches the source stream on disk before
-extracting partitions, so it can reuse that data after an interruption.
-Rerunning the same command reuses completed partition images whose sizes match
-the super image metadata and extracts any remaining partitions. Interrupted
-partition outputs are rebuilt from the cached source.
+local copy. With `--resume`, Asgard reuses completed partition images whose
+sizes match the super image metadata and extracts only the remaining
+partitions, so a rerun does not rebuild outputs it already wrote. Interrupted
+partition outputs are rebuilt from the source stream, which is read again up to
+and including the partitions that are still missing.
 
 ## Read files inside partitions
 

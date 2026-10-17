@@ -733,7 +733,7 @@ def extract_super_partitions(
         if not paths:
             return tuple(destinations)
         if resume:
-            # Extraction restarts from the cached super image; keep completed outputs.
+            # Completed outputs are kept and the rest are rebuilt from the source stream.
             for _destination, part_path in paths.values():
                 part_path.unlink(missing_ok=True)
         selected = tuple(partition for partition in selected if partition.name in paths)
