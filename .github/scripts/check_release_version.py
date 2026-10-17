@@ -96,7 +96,11 @@ def main() -> int:
         print(f"newest version on PyPI: {published}")
 
     forced = (os.environ.get("FORCE") or "").strip().lower() in TRUTHY
-    blocking = max([item for item in (*tagged, published) if item is not None and item >= version], default=None)
+    # The tag for this version is expected, so only a newer tag or a version on PyPI blocks.
+    blocking_versions = [item for item in tagged if item > version]
+    if published is not None and published >= version:
+        blocking_versions.append(published)
+    blocking = max(blocking_versions, default=None)
     if blocking is not None and not forced:
         print(
             f"::notice::{version} is already released (newest is {blocking}), so nothing is published. "
